@@ -28,6 +28,8 @@ sed -i 's/DEFAULT CURRENT_TIMESTAMP\(()\)\? ON UPDATE CURRENT_TIMESTAMP\(()\)\?/
 sed -i 's/DEFAULT NULL ON UPDATE CURRENT_TIMESTAMP\(()\)\?//ig' $path
 sed -i 's/CHARACTER SET utf8mb4 COLLATE utf8mb4_bin//g' $path
 sed -i "s/DEFAULT '0000-00-00 00:00:00'/DEFAULT '2000-01-01 00:00:00'/g" $path
+sed -i "s/DEFAULT '0000-00-00 00:00:00.000'/DEFAULT '2000-01-01 00:00:00.000'/g" $path
+sed -i "s/DEFAULT '0000-00-00 00:00:00.000000'/DEFAULT '2000-01-01 00:00:00.000000'/g" $path
 sed -i 's/DEFAULT CURRENT_TIMESTAMP\(()\)\?//ig' $path
 sed -i 's/DEFAULT b/DEFAULT/g' $path
 sed -i "s/DEFAULT \(\(\-\)\?[0-9]\+\(\.[0-9]\+\)\?\)/DEFAULT '\1'/g" $path
