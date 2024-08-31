@@ -41,6 +41,14 @@ public class PullUpSubqueryAliasToCTE extends PlanPreprocessor {
                                        StatementContext context) {
         Plan topPlan = visitChildren(this, unboundResultSink, context);
         if (!aliasQueries.isEmpty()) {
+            if (((UnboundResultSink) topPlan).child() instanceof LogicalCTE) {
+                LogicalCTE logicalCTE = (LogicalCTE) ((UnboundResultSink) topPlan).child();
+                List<LogicalSubQueryAlias<Plan>> subQueryAliases = new ArrayList<>();
+                subQueryAliases.addAll(logicalCTE.getAliasQueries());
+                subQueryAliases.addAll(aliasQueries);
+                return topPlan.withChildren(
+                        new LogicalCTE<>(subQueryAliases, (LogicalPlan) ((UnboundResultSink) topPlan).child()));
+            }
             return topPlan.withChildren(
                     new LogicalCTE<>(aliasQueries, (LogicalPlan) ((UnboundResultSink) topPlan).child()));
         }
@@ -71,6 +79,15 @@ public class PullUpSubqueryAliasToCTE extends PlanPreprocessor {
                 subQueryAlias = new LogicalSubQueryAlias<>(subQueryAlias.getAlias(), newSubQueryAlias);
             }
         }
-        return visitChildren(this, logicalCTE, context);
+        Plan cte = visitChildren(this, logicalCTE, context);
+        if (!aliasQueries.isEmpty()) {
+            LogicalCTE newLogicalCTE = (LogicalCTE) cte;
+            List<LogicalSubQueryAlias<Plan>> subQueryAliasesOfCte = new ArrayList<>();
+            subQueryAliasesOfCte.addAll(logicalCTE.getAliasQueries());
+            subQueryAliasesOfCte.addAll(aliasQueries);
+            aliasQueries = new ArrayList<>();
+            return new LogicalCTE<>(subQueryAliasesOfCte, (LogicalPlan) newLogicalCTE.child());
+        }
+        return cte;
     }
 }

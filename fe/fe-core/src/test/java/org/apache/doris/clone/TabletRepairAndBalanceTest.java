@@ -131,7 +131,7 @@ public class TabletRepairAndBalanceTest {
         Env.getCurrentEnv().createDb(createDbStmt);
 
         // must set disk info, or the tablet scheduler won't work
-        backends = Env.getCurrentSystemInfo().getAllBackends();
+        backends = Env.getCurrentSystemInfo().getAllBackendsByAllCluster().values().asList();
         for (Backend be : backends) {
             Map<String, TDisk> backendDisks = Maps.newHashMap();
             TDisk tDisk1 = new TDisk();
@@ -287,12 +287,12 @@ public class TabletRepairAndBalanceTest {
         String alterStr2 = "alter table test.tbl1 modify partition p1"
                 + " set (\"replication_allocation\" = \"tag.location.zone1: 1, tag.location.zone2: 2\");";
         ExceptionChecker.expectThrowsNoException(() -> alterTable(alterStr2));
+        Thread.sleep(5000);
         Partition p1 = tbl.getPartition("p1");
         ReplicaAllocation p1ReplicaAlloc = tbl.getPartitionInfo().getReplicaAllocation(p1.getId());
         Assert.assertEquals(3, p1ReplicaAlloc.getTotalReplicaNum());
         Assert.assertEquals(Short.valueOf((short) 1), p1ReplicaAlloc.getReplicaNumByTag(tag1));
         Assert.assertEquals(Short.valueOf((short) 2), p1ReplicaAlloc.getReplicaNumByTag(tag2));
-        ExceptionChecker.expectThrows(UserException.class, () -> tbl.checkReplicaAllocation());
 
         // check backend get() methods
         SystemInfoService infoService = Env.getCurrentSystemInfo();

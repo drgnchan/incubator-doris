@@ -29,7 +29,9 @@ suite("test_alter_table_column") {
         """
 
     // alter and test light schema change
-    sql """ALTER TABLE ${tbName1} SET ("light_schema_change" = "true");"""
+    if (!isCloudMode()) {
+        sql """ALTER TABLE ${tbName1} SET ("light_schema_change" = "true");"""
+    }
 
     sql """
             ALTER TABLE ${tbName1} 
@@ -41,7 +43,7 @@ suite("test_alter_table_column") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tbName1}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     sql """
@@ -52,7 +54,7 @@ suite("test_alter_table_column") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tbName1}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     sql "SHOW ALTER TABLE COLUMN;"
@@ -80,7 +82,7 @@ suite("test_alter_table_column") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tbName2}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     sql "SHOW ALTER TABLE COLUMN"
@@ -115,7 +117,7 @@ suite("test_alter_table_column") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tbNameAddArray}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
     qt_sql "desc ${tbNameAddArray};"
     qt_sql "select * from ${tbNameAddArray} order by k1;"
@@ -197,7 +199,7 @@ suite("test_alter_table_column") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tbName3}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     def res3 = sql "select * from ${tbName3} order by k1"

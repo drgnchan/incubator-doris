@@ -73,7 +73,8 @@ public:
 
     void change(const IColumn& column, size_t row_num, Arena*) {
         has_value = true;
-        value = assert_cast<const ColumnBitmap&>(column).get_data()[row_num];
+        value = assert_cast<const ColumnBitmap&, TypeCheckOnRelease::DISABLE>(column)
+                        .get_data()[row_num];
     }
 
     void change(const Self& to, Arena*) {
@@ -167,7 +168,7 @@ public:
 
     DataTypePtr get_return_type() const override { return value_type; }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena* arena) const override {
         this->data(place).change_if_better(*columns[0], *columns[1], row_num, arena);
     }

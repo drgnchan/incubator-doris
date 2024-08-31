@@ -508,9 +508,6 @@ public class Analyzer {
 
     private final GlobalState globalState;
 
-    // Attached PrepareStmt
-    public PrepareStmt prepareStmt;
-
     private final InferPredicateState inferPredicateState;
 
     // An analyzer stores analysis state for a single select block. A select block can be
@@ -630,14 +627,6 @@ public class Analyzer {
         explicitViewAlias = alias;
     }
 
-    public void setPrepareStmt(PrepareStmt stmt) {
-        prepareStmt = stmt;
-    }
-
-    public PrepareStmt getPrepareStmt() {
-        return prepareStmt;
-    }
-
     public String getExplicitViewAlias() {
         return explicitViewAlias;
     }
@@ -673,7 +662,7 @@ public class Analyzer {
         Calendar currentDate = Calendar.getInstance();
         LocalDateTime localDateTime = LocalDateTime.ofInstant(currentDate.toInstant(),
                 currentDate.getTimeZone().toZoneId());
-        String nowStr = localDateTime.format(TimeUtils.DATETIME_NS_FORMAT);
+        String nowStr = localDateTime.format(TimeUtils.getDatetimeNsFormatWithTimeZone());
         queryGlobals.setNowString(nowStr);
         queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
         return queryGlobals;
@@ -841,7 +830,7 @@ public class Analyzer {
                 .getDbOrAnalysisException(tableName.getDb());
         TableIf table = database.getTableOrAnalysisException(tableName.getTbl());
 
-        if (table.getType() == TableType.OLAP && (((OlapTable) table).getState() == OlapTableState.RESTORE
+        if (table.isManagedTable() && (((OlapTable) table).getState() == OlapTableState.RESTORE
                 || ((OlapTable) table).getState() == OlapTableState.RESTORE_WITH_LOAD)) {
             Boolean isNotRestoring = ((OlapTable) table).getPartitions().stream()
                     .filter(partition -> partition.getState() == PartitionState.RESTORE).collect(Collectors.toList())
@@ -2327,6 +2316,9 @@ public class Analyzer {
                         lastCompatibleExpr, exprLists.get(j).get(i));
                 lastCompatibleExpr = exprLists.get(j).get(i);
             }
+            if (compatibleType.isDecimalV3()) {
+                compatibleType = adjustDecimalV3PrecisionAndScale((ScalarType) compatibleType);
+            }
             // Now that we've found a compatible type, add implicit casts if necessary.
             for (int j = 0; j < exprLists.size(); ++j) {
                 if (!exprLists.get(j).get(i).getType().equals(compatibleType)) {
@@ -2335,6 +2327,21 @@ public class Analyzer {
                 }
             }
         }
+    }
+
+    private ScalarType adjustDecimalV3PrecisionAndScale(ScalarType decimalV3Type) {
+        ScalarType resultType = decimalV3Type;
+        int oldPrecision = decimalV3Type.getPrecision();
+        int oldScale = decimalV3Type.getDecimalDigits();
+        int integerPart = oldPrecision - oldScale;
+        int maxPrecision =
+                SessionVariable.getEnableDecimal256() ? ScalarType.MAX_DECIMAL256_PRECISION
+                        : ScalarType.MAX_DECIMAL128_PRECISION;
+        if (oldPrecision > maxPrecision) {
+            int newScale = maxPrecision - integerPart;
+            resultType = ScalarType.createDecimalType(maxPrecision, newScale < 0 ? 0 : newScale);
+        }
+        return resultType;
     }
 
     public long getConnectId() {

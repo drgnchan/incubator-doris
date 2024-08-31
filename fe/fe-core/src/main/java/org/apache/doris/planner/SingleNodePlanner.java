@@ -69,9 +69,11 @@ import org.apache.doris.datasource.hive.source.HiveScanNode;
 import org.apache.doris.datasource.hudi.source.HudiScanNode;
 import org.apache.doris.datasource.iceberg.source.IcebergScanNode;
 import org.apache.doris.datasource.jdbc.source.JdbcScanNode;
+import org.apache.doris.datasource.lakesoul.source.LakeSoulScanNode;
 import org.apache.doris.datasource.maxcompute.source.MaxComputeScanNode;
 import org.apache.doris.datasource.odbc.source.OdbcScanNode;
 import org.apache.doris.datasource.paimon.source.PaimonScanNode;
+import org.apache.doris.datasource.trinoconnector.source.TrinoConnectorScanNode;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.rewrite.mvrewrite.MVSelectFailedException;
 import org.apache.doris.statistics.StatisticalType;
@@ -96,6 +98,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -308,9 +311,6 @@ public class SingleNodePlanner {
             // TODO: External sort could be used for very large limits
             // not just unlimited order-by
             boolean useTopN = true;
-            if (limit == -1 && analyzer.getContext().getSessionVariable().enableSpilling) {
-                useTopN = false;
-            }
             root = new SortNode(ctx.getNextNodeId(), root, stmt.getSortInfo(),
                     useTopN);
             ((SortNode) root).setDefaultLimit(limit == -1);
@@ -1962,7 +1962,14 @@ public class SingleNodePlanner {
                 TableIf table = tblRef.getDesc().getTable();
                 switch (((HMSExternalTable) table).getDlaType()) {
                     case HUDI:
-                        scanNode = new HudiScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true);
+                        // Old planner does not support hudi incremental read,
+                        // so just pass Optional.empty() to HudiScanNode
+                        if (tblRef.getScanParams() != null) {
+                            throw new UserException("Hudi incremental read is not supported, "
+                                    + "please set enable_nereids_planner = true to enable new optimizer");
+                        }
+                        scanNode = new HudiScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true,
+                                Optional.empty(), Optional.empty());
                         break;
                     case ICEBERG:
                         scanNode = new IcebergScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true);
@@ -1981,6 +1988,9 @@ public class SingleNodePlanner {
             case PAIMON_EXTERNAL_TABLE:
                 scanNode = new PaimonScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true);
                 break;
+            case TRINO_CONNECTOR_EXTERNAL_TABLE:
+                scanNode = new TrinoConnectorScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true);
+                break;
             case MAX_COMPUTE_EXTERNAL_TABLE:
                 // TODO: support max compute scan node
                 scanNode = new MaxComputeScanNode(ctx.getNextNodeId(), tblRef.getDesc(), "MCScanNode",
@@ -1992,11 +2002,14 @@ public class SingleNodePlanner {
             case JDBC_EXTERNAL_TABLE:
                 scanNode = new JdbcScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true);
                 break;
+            case LAKESOUl_EXTERNAL_TABLE:
+                scanNode = new LakeSoulScanNode(ctx.getNextNodeId(), tblRef.getDesc(), true);
+                break;
             case TEST_EXTERNAL_TABLE:
                 scanNode = new TestExternalTableScanNode(ctx.getNextNodeId(), tblRef.getDesc());
                 break;
             default:
-                throw new UserException("Not supported table type" + tblRef.getTable().getType());
+                throw new UserException("Not supported table type: " + tblRef.getTable().getType());
         }
         if (scanNode instanceof OlapScanNode || scanNode instanceof EsScanNode
                 || scanNode instanceof OdbcScanNode || scanNode instanceof JdbcScanNode
@@ -2897,3 +2910,4 @@ public class SingleNodePlanner {
         return result;
     }
 }
+

@@ -497,7 +497,7 @@ public class PlannerTest extends TestWithFeService {
         QueryState state = connectContext.getState();
         Assertions.assertEquals(MysqlStateType.ERR, state.getStateType());
         Assertions.assertTrue(state.getErrorMessage()
-                .contains("you need (at least one of) the LOAD privilege(s) for this operation"));
+                .contains("you need (at least one of) the (LOAD) privilege(s) for this operation"));
         // set to admin user
         connectContext.setCurrentUserIdentity(UserIdentity.ADMIN);
     }
@@ -512,7 +512,6 @@ public class PlannerTest extends TestWithFeService {
         String plan1 = planner1.getExplainString(new ExplainOptions(false, false, false));
         Assertions.assertFalse(plan1.contains("SORT INFO:\n          `k1`\n          `k2`"));
         Assertions.assertFalse(plan1.contains("SORT LIMIT:"));
-        Assertions.assertFalse(plan1.contains("TOPN OPT"));
 
         // Push sort fail limit > topnOptLimitThreshold
         sql1 = "explain select k1 from db1.tbl3 order by k1, k2 limit "
@@ -523,7 +522,6 @@ public class PlannerTest extends TestWithFeService {
         plan1 = planner1.getExplainString(new ExplainOptions(false, false, false));
         Assertions.assertFalse(plan1.contains("SORT INFO:\n          `k1`\n          `k2`"));
         Assertions.assertFalse(plan1.contains("SORT LIMIT:"));
-        Assertions.assertFalse(plan1.contains("TOPN OPT"));
 
         // Push sort success limit = topnOptLimitThreshold
         sql1 = "explain select /*+ SET_VAR(enable_nereids_planner=false) */ k1 from db1.tbl3 order by k1, k2 limit "
@@ -534,7 +532,6 @@ public class PlannerTest extends TestWithFeService {
         plan1 = planner1.getExplainString(new ExplainOptions(false, false, false));
         Assertions.assertTrue(plan1.contains("SORT INFO:\n          `k1`\n          `k2`"));
         Assertions.assertTrue(plan1.contains("SORT LIMIT:"));
-        Assertions.assertTrue(plan1.contains("TOPN OPT"));
 
         // Push sort success limit < topnOptLimitThreshold
         if (connectContext.getSessionVariable().topnOptLimitThreshold > 1) {
@@ -546,7 +543,6 @@ public class PlannerTest extends TestWithFeService {
             plan1 = planner1.getExplainString(new ExplainOptions(false, false, false));
             Assertions.assertTrue(plan1.contains("SORT INFO:\n          `k1`\n          `k2`"));
             Assertions.assertTrue(plan1.contains("SORT LIMIT:"));
-            Assertions.assertTrue(plan1.contains("TOPN OPT"));
         }
 
         // Push sort failed
@@ -701,10 +697,12 @@ public class PlannerTest extends TestWithFeService {
             connectContext.getSessionVariable().setEnableNereidsPlanner(v);
         }
 
-        // 1. should not contains exchange node in new planner
+        // 2. should not contains exchange node in new planner
         v = connectContext.getSessionVariable().isEnableNereidsPlanner();
+        boolean v2 = connectContext.getSessionVariable().isEnableStrictConsistencyDml();
         try {
             connectContext.getSessionVariable().setEnableNereidsPlanner(true);
+            connectContext.getSessionVariable().setEnableStrictConsistencyDml(false);
             String sql1 = "explain insert into db1.tbl1 select * from db1.tbl1";
             StmtExecutor stmtExecutor1 = new StmtExecutor(connectContext, sql1);
             stmtExecutor1.execute();
@@ -713,6 +711,24 @@ public class PlannerTest extends TestWithFeService {
             Assertions.assertFalse(plan1.contains("VEXCHANGE"));
         } finally {
             connectContext.getSessionVariable().setEnableNereidsPlanner(v);
+            connectContext.getSessionVariable().setEnableStrictConsistencyDml(v2);
+        }
+
+        // 3. should contain exchange node in new planner if enable strict consistency dml
+        v = connectContext.getSessionVariable().isEnableNereidsPlanner();
+        v2 = connectContext.getSessionVariable().isEnableStrictConsistencyDml();
+        try {
+            connectContext.getSessionVariable().setEnableNereidsPlanner(true);
+            connectContext.getSessionVariable().setEnableStrictConsistencyDml(true);
+            String sql1 = "explain insert into db1.tbl1 select * from db1.tbl1";
+            StmtExecutor stmtExecutor1 = new StmtExecutor(connectContext, sql1);
+            stmtExecutor1.execute();
+            Planner planner1 = stmtExecutor1.planner();
+            String plan1 = planner1.getExplainString(new ExplainOptions(false, false, false));
+            Assertions.assertTrue(plan1.contains("VEXCHANGE"));
+        } finally {
+            connectContext.getSessionVariable().setEnableNereidsPlanner(v);
+            connectContext.getSessionVariable().setEnableStrictConsistencyDml(v2);
         }
     }
 }

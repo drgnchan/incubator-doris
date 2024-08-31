@@ -51,7 +51,7 @@ suite("test_group_commit_interval_ms_property") {
                 v bigint
                 )  
                 UNIQUE KEY(k)  
-                DISTRIBUTED BY HASH (v) BUCKETS 8
+                DISTRIBUTED BY HASH (k) BUCKETS 8
                 PROPERTIES(  
                 "replication_num" = "1",
                 "group_commit_interval_ms"="10000"
@@ -63,11 +63,10 @@ suite("test_group_commit_interval_ms_property") {
             sql """ set group_commit = async_mode; """
 
             if (item == "nereids") {
-                sql """ set enable_nereids_dml = true; """
                 sql """ set enable_nereids_planner=true; """
-                //sql """ set enable_fallback_to_original_planner=false; """
+                sql """ set enable_fallback_to_original_planner=false; """
             } else {
-                sql """ set enable_nereids_dml = false; """
+                sql """ set enable_nereids_planner = false; """
             }
 
             def res1 = sql """show create table ${test_table}"""

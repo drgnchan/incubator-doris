@@ -40,6 +40,8 @@
 
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/config.h"
+#include "runtime/exec_env.h"
+#include "util/dns_cache.h"
 #include "util/network_util.h"
 
 namespace doris {
@@ -57,7 +59,8 @@ namespace doris {
 template <class T>
 class BrpcClientCache {
 public:
-    BrpcClientCache();
+    BrpcClientCache(std::string protocol = "baidu_std", std::string connection_type = "",
+                    std::string connection_group = "");
     virtual ~BrpcClientCache();
 
     std::shared_ptr<T> get_client(const butil::EndPoint& endpoint) {
@@ -75,11 +78,15 @@ public:
     }
 #endif
 
+    std::shared_ptr<T> get_client(const PNetworkAddress& paddr) {
+        return get_client(paddr.hostname(), paddr.port());
+    }
+
     std::shared_ptr<T> get_client(const std::string& host, int port) {
         std::string realhost;
         realhost = host;
         if (!is_valid_ip(host)) {
-            Status status = hostname_to_ip(host, realhost);
+            Status status = ExecEnv::GetInstance()->dns_cache()->get(host, &realhost);
             if (!status.ok()) {
                 LOG(WARNING) << "failed to get ip from host:" << status.to_string();
                 return nullptr;
@@ -104,18 +111,27 @@ public:
     }
 
     std::shared_ptr<T> get_new_client_no_cache(const std::string& host_port,
-                                               const std::string& protocol = "baidu_std",
-                                               const std::string& connect_type = "") {
+                                               const std::string& protocol = "",
+                                               const std::string& connection_type = "",
+                                               const std::string& connection_group = "") {
         brpc::ChannelOptions options;
-        if constexpr (std::is_same_v<T, PFunctionService_Stub>) {
-            options.protocol = config::function_service_protocol;
-        } else {
+        if (protocol != "") {
             options.protocol = protocol;
+        } else if (_protocol != "") {
+            options.protocol = _protocol;
         }
-        if (connect_type != "") {
-            options.connection_type = connect_type;
+        if (connection_type != "") {
+            options.connection_type = connection_type;
+        } else if (_connection_type != "") {
+            options.connection_type = _connection_type;
+        }
+        if (connection_group != "") {
+            options.connection_group = connection_group;
+        } else if (_connection_group != "") {
+            options.connection_group = _connection_group;
         }
         options.connect_timeout_ms = 2000;
+        options.timeout_ms = 2000;
         options.max_retry = 10;
 
         std::unique_ptr<brpc::Channel> channel(new brpc::Channel());
@@ -193,6 +209,9 @@ public:
 
 private:
     StubMap<T> _stub_map;
+    const std::string _protocol;
+    const std::string _connection_type;
+    const std::string _connection_group;
 };
 
 using InternalServiceClientCache = BrpcClientCache<PBackendService_Stub>;

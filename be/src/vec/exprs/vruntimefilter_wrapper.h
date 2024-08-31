@@ -17,9 +17,8 @@
 
 #pragma once
 
-#include <stdint.h>
-
 #include <atomic>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -27,12 +26,18 @@
 #include "common/object_pool.h"
 #include "common/status.h"
 #include "udf/udf.h"
+#include "util/runtime_profile.h"
 #include "vec/exprs/vexpr.h"
 
 namespace doris {
 class RowDescriptor;
 class RuntimeState;
 class TExprNode;
+
+double get_in_list_ignore_thredhold(size_t list_size);
+double get_comparison_ignore_thredhold();
+double get_bloom_filter_ignore_thredhold();
+
 namespace vectorized {
 class Block;
 class VExprContext;
@@ -40,11 +45,13 @@ class VExprContext;
 } // namespace doris
 
 namespace doris::vectorized {
+
 class VRuntimeFilterWrapper final : public VExpr {
     ENABLE_FACTORY_CREATOR(VRuntimeFilterWrapper);
 
 public:
-    VRuntimeFilterWrapper(const TExprNode& node, const VExprSPtr& impl);
+    VRuntimeFilterWrapper(const TExprNode& node, const VExprSPtr& impl, double ignore_thredhold,
+                          bool null_aware = false);
     ~VRuntimeFilterWrapper() override = default;
     Status execute(VExprContext* context, Block* block, int* result_column_id) override;
     Status prepare(RuntimeState* state, const RowDescriptor& desc, VExprContext* context) override;
@@ -57,29 +64,53 @@ public:
 
     const VExprSPtr get_impl() const override { return _impl; }
 
-    // if filter rate less than this, bloom filter will set always true
-    constexpr static double EXPECTED_FILTER_RATE = 0.4;
+    void attach_profile_counter(RuntimeProfile::Counter* expr_filtered_rows_counter,
+                                RuntimeProfile::Counter* expr_input_rows_counter,
+                                RuntimeProfile::Counter* always_true_counter) {
+        _expr_filtered_rows_counter = expr_filtered_rows_counter;
+        _expr_input_rows_counter = expr_input_rows_counter;
+        _always_true_counter = always_true_counter;
+    }
 
-    static void calculate_filter(double ignore_threshold, int64_t filter_rows, int64_t scan_rows,
-                                 bool& has_calculate, bool& always_true) {
-        if ((!has_calculate) && (scan_rows > config::rf_predicate_check_row_num)) {
-            if (filter_rows / (scan_rows * 1.0) < ignore_threshold) {
-                always_true = true;
-            }
-            has_calculate = true;
+    template <typename T, typename TT>
+    static void judge_selectivity(double ignore_threshold, int64_t filter_rows, int64_t input_rows,
+                                  T& always_true, TT& judge_counter) {
+        always_true = filter_rows / (input_rows * 1.0) < ignore_threshold;
+        judge_counter = config::runtime_filter_sampling_frequency;
+    }
+
+    bool need_judge_selectivity() override {
+        if (_judge_counter <= 0) {
+            _always_true = false;
+            return true;
+        }
+        return false;
+    }
+
+    void do_judge_selectivity(int64_t filter_rows, int64_t input_rows) override {
+        judge_selectivity(_ignore_thredhold, filter_rows, input_rows, _always_true, _judge_counter);
+        if (_expr_filtered_rows_counter) {
+            COUNTER_UPDATE(_expr_filtered_rows_counter, filter_rows);
+        }
+        if (_expr_input_rows_counter) {
+            COUNTER_UPDATE(_expr_input_rows_counter, input_rows);
         }
     }
 
 private:
     VExprSPtr _impl;
+    std::atomic_int _judge_counter = 0;
+    std::atomic_int _always_true = false;
 
-    bool _always_true;
-    /// TODO: statistic filter rate in the profile
-    std::atomic<int64_t> _filtered_rows;
-    std::atomic<int64_t> _scan_rows;
-
-    bool _has_calculate_filter = false;
+    RuntimeProfile::Counter* _expr_filtered_rows_counter = nullptr;
+    RuntimeProfile::Counter* _expr_input_rows_counter = nullptr;
+    RuntimeProfile::Counter* _always_true_counter = nullptr;
 
     std::string _expr_name;
+    double _ignore_thredhold;
+    bool _null_aware;
 };
+
+using VRuntimeFilterPtr = std::shared_ptr<VRuntimeFilterWrapper>;
+
 } // namespace doris::vectorized

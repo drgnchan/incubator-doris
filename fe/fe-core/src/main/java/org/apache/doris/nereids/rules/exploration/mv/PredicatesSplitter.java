@@ -22,12 +22,13 @@ import org.apache.doris.nereids.trees.expressions.Cast;
 import org.apache.doris.nereids.trees.expressions.ComparisonPredicate;
 import org.apache.doris.nereids.trees.expressions.EqualPredicate;
 import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.InPredicate;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.visitor.DefaultExpressionVisitor;
 import org.apache.doris.nereids.util.ExpressionUtils;
 
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -38,9 +39,9 @@ import java.util.Set;
  */
 public class PredicatesSplitter {
 
-    private final Set<Expression> equalPredicates = new HashSet<>();
-    private final Set<Expression> rangePredicates = new HashSet<>();
-    private final Set<Expression> residualPredicates = new HashSet<>();
+    private final Set<Expression> equalPredicates = new LinkedHashSet<>();
+    private final Set<Expression> rangePredicates = new LinkedHashSet<>();
+    private final Set<Expression> residualPredicates = new LinkedHashSet<>();
     private final List<Expression> conjunctExpressions;
 
     public PredicatesSplitter(Expression target) {
@@ -77,6 +78,17 @@ public class PredicatesSplitter {
                 rangePredicates.add(comparisonPredicate);
             } else {
                 residualPredicates.add(comparisonPredicate);
+            }
+            return null;
+        }
+
+        @Override
+        public Void visitInPredicate(InPredicate inPredicate, Void context) {
+            if (containOnlyColumnRef(inPredicate.getCompareExpr(), true)
+                    && (ExpressionUtils.isAllLiteral(inPredicate.getOptions()))) {
+                rangePredicates.add(inPredicate);
+            } else {
+                residualPredicates.add(inPredicate);
             }
             return null;
         }

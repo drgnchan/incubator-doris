@@ -17,8 +17,12 @@
 
 package org.apache.doris.nereids.rules.exploration.mv;
 
-import org.apache.doris.nereids.rules.exploration.mv.mapping.EquivalenceClassSetMapping;
+import org.apache.doris.nereids.CascadesContext;
+import org.apache.doris.nereids.rules.exploration.mv.mapping.EquivalenceClassMapping;
 import org.apache.doris.nereids.rules.exploration.mv.mapping.SlotMapping;
+import org.apache.doris.nereids.rules.expression.ExpressionNormalization;
+import org.apache.doris.nereids.rules.expression.ExpressionOptimization;
+import org.apache.doris.nereids.rules.expression.ExpressionRewriteContext;
 import org.apache.doris.nereids.trees.expressions.EqualTo;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
@@ -29,6 +33,7 @@ import org.apache.doris.nereids.util.Utils;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -37,7 +42,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * This record the predicates which can be pulled up or some other type predicates.
@@ -64,11 +68,6 @@ public class Predicates {
         Set<Expression> mergedPredicates = new HashSet<>(predicates);
         mergedPredicates.addAll(this.pulledUpPredicates);
         return new Predicates(mergedPredicates);
-    }
-
-    public Expression composedExpression() {
-        return ExpressionUtils.and(pulledUpPredicates.stream().map(Expression.class::cast)
-                .collect(Collectors.toList()));
     }
 
     /**
@@ -100,15 +99,15 @@ public class Predicates {
         if (queryEquivalenceClass.isEmpty() && !viewEquivalenceClass.isEmpty()) {
             return null;
         }
-        EquivalenceClassSetMapping queryToViewEquivalenceMapping =
-                EquivalenceClassSetMapping.generate(queryEquivalenceClass, viewEquivalenceClassQueryBased);
+        EquivalenceClassMapping queryToViewEquivalenceMapping =
+                EquivalenceClassMapping.generate(queryEquivalenceClass, viewEquivalenceClassQueryBased);
         // can not map all target equivalence class, can not compensate
         if (queryToViewEquivalenceMapping.getEquivalenceClassSetMap().size()
                 < viewEquivalenceClass.getEquivalenceSetList().size()) {
             return null;
         }
         // do equal compensate
-        Set<Set<SlotReference>> mappedQueryEquivalenceSet =
+        Set<List<SlotReference>> mappedQueryEquivalenceSet =
                 queryToViewEquivalenceMapping.getEquivalenceClassSetMap().keySet();
         queryEquivalenceClass.getEquivalenceSetList().forEach(
                 queryEquivalenceSet -> {
@@ -122,9 +121,9 @@ public class Predicates {
                         }
                     } else {
                         // compensate the equivalence both in query and view, but query has more equivalence
-                        Set<SlotReference> viewEquivalenceSet =
+                        List<SlotReference> viewEquivalenceSet =
                                 queryToViewEquivalenceMapping.getEquivalenceClassSetMap().get(queryEquivalenceSet);
-                        Set<SlotReference> copiedQueryEquivalenceSet = new HashSet<>(queryEquivalenceSet);
+                        List<SlotReference> copiedQueryEquivalenceSet = new ArrayList<>(queryEquivalenceSet);
                         copiedQueryEquivalenceSet.removeAll(viewEquivalenceSet);
                         SlotReference first = viewEquivalenceSet.iterator().next();
                         for (SlotReference slotReference : copiedQueryEquivalenceSet) {
@@ -143,8 +142,8 @@ public class Predicates {
     public static Set<Expression> compensateRangePredicate(StructInfo queryStructInfo,
             StructInfo viewStructInfo,
             SlotMapping viewToQuerySlotMapping,
-            ComparisonResult comparisonResult) {
-        // TODO Range predicates compensate, simplify implementation currently.
+            ComparisonResult comparisonResult,
+            CascadesContext cascadesContext) {
         SplitPredicate querySplitPredicate = queryStructInfo.getSplitPredicate();
         SplitPredicate viewSplitPredicate = viewStructInfo.getSplitPredicate();
 
@@ -153,20 +152,32 @@ public class Predicates {
         Expression viewRangePredicateQueryBased =
                 ExpressionUtils.replace(viewRangePredicate, viewToQuerySlotMapping.toSlotReferenceMap());
 
-        Set<Expression> queryRangeSet =
-                Sets.newHashSet(ExpressionUtils.extractConjunction(queryRangePredicate));
-        Set<Expression> viewRangeQueryBasedSet =
-                Sets.newHashSet(ExpressionUtils.extractConjunction(viewRangePredicateQueryBased));
-        // remove unnecessary literal BooleanLiteral.TRUE
-        queryRangeSet.remove(BooleanLiteral.TRUE);
-        viewRangeQueryBasedSet.remove(BooleanLiteral.TRUE);
-        // query residual predicate can not contain all view residual predicate when view have residual predicate,
-        // bail out
-        if (!queryRangeSet.containsAll(viewRangeQueryBasedSet)) {
+        Set<Expression> queryRangeSet = ExpressionUtils.extractConjunctionToSet(queryRangePredicate);
+        Set<Expression> viewRangeQueryBasedSet = ExpressionUtils.extractConjunctionToSet(viewRangePredicateQueryBased);
+        Set<Expression> differentExpressions = new HashSet<>();
+        Sets.difference(queryRangeSet, viewRangeQueryBasedSet).copyInto(differentExpressions);
+        Sets.difference(viewRangeQueryBasedSet, queryRangeSet).copyInto(differentExpressions);
+        // the range predicate in query and view is same, don't need to compensate
+        if (differentExpressions.isEmpty()) {
+            return differentExpressions;
+        }
+        // try to normalize the different expressions
+        Set<Expression> normalizedExpressions =
+                normalizeExpression(ExpressionUtils.and(differentExpressions), cascadesContext);
+        if (!queryRangeSet.containsAll(normalizedExpressions)) {
+            // normalized expressions is not in query, can not compensate
             return null;
         }
-        queryRangeSet.removeAll(viewRangeQueryBasedSet);
-        return queryRangeSet;
+        return normalizedExpressions;
+    }
+
+    private static Set<Expression> normalizeExpression(Expression expression, CascadesContext cascadesContext) {
+        ExpressionNormalization expressionNormalization = new ExpressionNormalization();
+        ExpressionOptimization expressionOptimization = new ExpressionOptimization();
+        ExpressionRewriteContext context = new ExpressionRewriteContext(cascadesContext);
+        expression = expressionNormalization.rewrite(expression, context);
+        expression = expressionOptimization.rewrite(expression, context);
+        return ExpressionUtils.extractConjunctionToSet(expression);
     }
 
     /**

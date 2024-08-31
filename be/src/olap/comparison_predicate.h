@@ -67,7 +67,7 @@ public:
                                bitmap);
     }
 
-    Status evaluate(const vectorized::NameAndTypePair& name_with_type,
+    Status evaluate(const vectorized::IndexFieldNameAndTypePair& name_with_type,
                     InvertedIndexIterator* iterator, uint32_t num_rows,
                     roaring::Roaring* bitmap) const override {
         if (iterator == nullptr) {
@@ -99,11 +99,13 @@ public:
             return Status::InvalidArgument("invalid comparison predicate type {}", PT);
         }
 
-        roaring::Roaring roaring;
+        std::shared_ptr<roaring::Roaring> roaring = std::make_shared<roaring::Roaring>();
 
-        auto&& value = PrimitiveTypeConvertor<Type>::to_storage_field_type(_value);
-        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, &value, query_type,
-                                                           num_rows, &roaring));
+        std::unique_ptr<InvertedIndexQueryParamFactory> query_param = nullptr;
+        RETURN_IF_ERROR(
+                InvertedIndexQueryParamFactory::create_query_value<Type>(&_value, query_param));
+        RETURN_IF_ERROR(iterator->read_from_inverted_index(column_name, query_param->get_value(),
+                                                           query_type, num_rows, roaring));
 
         // mask out null_bitmap, since NULL cmp VALUE will produce NULL
         //  and be treated as false in WHERE
@@ -118,9 +120,9 @@ public:
         }
 
         if constexpr (PT == PredicateType::NE) {
-            *bitmap -= roaring;
+            *bitmap -= *roaring;
         } else {
-            *bitmap &= roaring;
+            *bitmap &= *roaring;
         }
 
         return Status::OK();
@@ -244,14 +246,17 @@ public:
     template <bool is_and>
     __attribute__((flatten)) void _evaluate_vec_internal(const vectorized::IColumn& column,
                                                          uint16_t size, bool* flags) const {
-        if (_can_ignore() && !_has_calculate_filter) {
+        uint16_t current_evaluated_rows = 0;
+        uint16_t current_passed_rows = 0;
+        if (_can_ignore()) {
             if (is_and) {
                 for (uint16_t i = 0; i < size; i++) {
-                    _evaluated_rows += flags[i];
+                    current_evaluated_rows += flags[i];
                 }
             } else {
-                _evaluated_rows += size;
+                current_evaluated_rows += size;
             }
+            _evaluated_rows += current_evaluated_rows;
         }
 
         if (column.is_nullable()) {
@@ -283,6 +288,7 @@ public:
                     } while (false);
                 } else {
                     LOG(FATAL) << "column_dictionary must use StringRef predicate.";
+                    __builtin_unreachable();
                 }
             } else {
                 auto* data_array =
@@ -313,6 +319,7 @@ public:
                     } while (false);
                 } else {
                     LOG(FATAL) << "column_dictionary must use StringRef predicate.";
+                    __builtin_unreachable();
                 }
             } else {
                 auto* data_array =
@@ -332,13 +339,14 @@ public:
             }
         }
 
-        if (_can_ignore() && !_has_calculate_filter) {
+        if (_can_ignore() && !_judge_counter) {
             for (uint16_t i = 0; i < size; i++) {
-                _passed_rows += flags[i];
+                current_passed_rows += flags[i];
             }
-            vectorized::VRuntimeFilterWrapper::calculate_filter(
-                    get_ignore_threshold(), _evaluated_rows - _passed_rows, _evaluated_rows,
-                    _has_calculate_filter, _always_true);
+            _passed_rows += current_passed_rows;
+            vectorized::VRuntimeFilterWrapper::judge_selectivity(
+                    get_ignore_threshold(), current_evaluated_rows - current_passed_rows,
+                    current_evaluated_rows, _always_true, _judge_counter);
         }
     }
 
@@ -352,8 +360,7 @@ public:
         _evaluate_vec_internal<true>(column, size, flags);
     }
 
-    // todo: It may be necessary to set a more reasonable threshold
-    double get_ignore_threshold() const override { return 0.1; }
+    double get_ignore_threshold() const override { return get_comparison_ignore_thredhold(); }
 
 private:
     uint16_t _evaluate_inner(const vectorized::IColumn& column, uint16_t* sel,
@@ -445,12 +452,12 @@ private:
     void _evaluate_bit(const vectorized::IColumn& column, const uint16_t* sel, uint16_t size,
                        bool* flags) const {
         if (column.is_nullable()) {
-            auto* nullable_column_ptr =
+            const auto* nullable_column_ptr =
                     vectorized::check_and_get_column<vectorized::ColumnNullable>(column);
-            auto& nested_column = nullable_column_ptr->get_nested_column();
-            auto& null_map = reinterpret_cast<const vectorized::ColumnUInt8&>(
-                                     nullable_column_ptr->get_null_map_column())
-                                     .get_data();
+            const auto& nested_column = nullable_column_ptr->get_nested_column();
+            const auto& null_map = reinterpret_cast<const vectorized::ColumnUInt8&>(
+                                           nullable_column_ptr->get_null_map_column())
+                                           .get_data();
 
             _base_evaluate_bit<true, is_and>(&nested_column, null_map.data(), sel, size, flags);
         } else {
@@ -464,7 +471,7 @@ private:
                                                  const TArray* __restrict data_array,
                                                  const TValue& value) const {
         //uint8_t helps compiler to generate vectorized code
-        uint8_t* flags = reinterpret_cast<uint8_t*>(bflags);
+        auto* flags = reinterpret_cast<uint8_t*>(bflags);
         if constexpr (is_and) {
             for (uint16_t i = 0; i < size; i++) {
                 if constexpr (is_nullable) {
@@ -510,14 +517,15 @@ private:
                             const uint16_t* sel, uint16_t size, bool* flags) const {
         if (column->is_column_dictionary()) {
             if constexpr (std::is_same_v<T, StringRef>) {
-                auto* dict_column_ptr =
+                const auto* dict_column_ptr =
                         vectorized::check_and_get_column<vectorized::ColumnDictI32>(column);
-                auto* data_array = dict_column_ptr->get_data().data();
+                const auto* data_array = dict_column_ptr->get_data().data();
                 auto dict_code = _find_code_from_dictionary_column(*dict_column_ptr);
                 _base_loop_bit<is_nullable, is_and>(sel, size, flags, null_map, data_array,
                                                     dict_code);
             } else {
                 LOG(FATAL) << "column_dictionary must use StringRef predicate.";
+                __builtin_unreachable();
             }
         } else {
             auto* data_array =
@@ -535,10 +543,10 @@ private:
                             uint16_t* sel, uint16_t size) const {
         if (column->is_column_dictionary()) {
             if constexpr (std::is_same_v<T, StringRef>) {
-                auto* dict_column_ptr =
+                const auto* dict_column_ptr =
                         vectorized::check_and_get_column<vectorized::ColumnDictI32>(column);
-                auto& pred_col = dict_column_ptr->get_data();
-                auto pred_col_data = pred_col.data();
+                const auto& pred_col = dict_column_ptr->get_data();
+                const auto* pred_col_data = pred_col.data();
                 auto dict_code = _find_code_from_dictionary_column(*dict_column_ptr);
 
                 if constexpr (PT == PredicateType::EQ) {
@@ -578,24 +586,26 @@ private:
 
     __attribute__((flatten)) int32_t _find_code_from_dictionary_column(
             const vectorized::ColumnDictI32& column) const {
-        if (!_segment_id_to_cached_code.contains(column.get_rowset_segment_id())) {
-            int32_t code = _is_range() ? column.find_code_by_bound(_value, _is_greater(), _is_eq())
-                                       : column.find_code(_value);
-
-            // Sometimes the dict is not initialized when run comparison predicate here, for example,
-            // the full page is null, then the reader will skip read, so that the dictionary is not
-            // inited. The cached code is wrong during this case, because the following page maybe not
-            // null, and the dict should have items in the future.
-            //
-            // Cached code may have problems, so that add a config here, if not opened, then
-            // we will return the code and not cache it.
-            if (column.is_dict_empty() || !config::enable_low_cardinality_cache_code) {
-                return code;
-            }
-            // If the dict is not empty, then the dict is inited and we could cache the value.
-            _segment_id_to_cached_code[column.get_rowset_segment_id()] = code;
+        int32_t code = 0;
+        if (_segment_id_to_cached_code.if_contains(
+                    column.get_rowset_segment_id(),
+                    [&code](const auto& pair) { code = pair.second; })) {
+            return code;
         }
-        return _segment_id_to_cached_code[column.get_rowset_segment_id()];
+        code = _is_range() ? column.find_code_by_bound(_value, _is_greater(), _is_eq())
+                           : column.find_code(_value);
+        // Sometimes the dict is not initialized when run comparison predicate here, for example,
+        // the full page is null, then the reader will skip read, so that the dictionary is not
+        // inited. The cached code is wrong during this case, because the following page maybe not
+        // null, and the dict should have items in the future.
+        //
+        // Cached code may have problems, so that add a config here, if not opened, then
+        // we will return the code and not cache it.
+        if (!column.is_dict_empty() && config::enable_low_cardinality_cache_code) {
+            _segment_id_to_cached_code.emplace(std::pair {column.get_rowset_segment_id(), code});
+        }
+
+        return code;
     }
 
     std::string _debug_string() const override {
@@ -604,7 +614,13 @@ private:
         return info;
     }
 
-    mutable std::map<std::pair<RowsetId, uint32_t>, int32_t> _segment_id_to_cached_code;
+    mutable phmap::parallel_flat_hash_map<
+            std::pair<RowsetId, uint32_t>, int32_t,
+            phmap::priv::hash_default_hash<std::pair<RowsetId, uint32_t>>,
+            phmap::priv::hash_default_eq<std::pair<RowsetId, uint32_t>>,
+            std::allocator<std::pair<const std::pair<RowsetId, uint32_t>, int32_t>>, 4,
+            std::shared_mutex>
+            _segment_id_to_cached_code;
     T _value;
 };
 

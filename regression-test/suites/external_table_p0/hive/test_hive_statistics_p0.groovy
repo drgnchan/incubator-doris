@@ -17,10 +17,15 @@
 
 suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,external_docker_hive") {
     String enabled = context.config.otherConfigs.get("enableHiveTest")
-    if (enabled != null && enabled.equalsIgnoreCase("true")) {
+    if (enabled == null || !enabled.equalsIgnoreCase("true")) {
+        logger.info("diable Hive test.")
+        return;
+    }
+
+    for (String hivePrefix : ["hive2", "hive3"]) {
         try {
-            String hms_port = context.config.otherConfigs.get("hms_port")
-            String catalog_name = "test_hive_statistics_p0"
+            String hms_port = context.config.otherConfigs.get(hivePrefix + "HmsPort")
+            String catalog_name = "test_${hivePrefix}_statistics_p0"
             String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
 
             sql """drop catalog if exists ${catalog_name}"""
@@ -31,6 +36,20 @@ suite("test_hive_statistics_p0", "all_types,p0,external,hive,external_docker,ext
             sql """use `${catalog_name}`.`stats_test`"""
             sql """analyze database stats_test with sync"""
 
+            // Test hive scan node cardinality. Estimated row count.
+            for (int i = 0; i < 60; i++) {
+                def result = sql """show table stats `${catalog_name}`.`statistics`.`statistics`"""
+                logger.info("Table stats " + result)
+                if (!"66".equalsIgnoreCase(result[0][2])) {
+                    Thread.sleep(1000)
+                } else {
+                    explain {
+                        sql "select count(2) from `${catalog_name}`.`statistics`.`statistics`;"
+                        contains "cardinality=66"
+                    }
+                    break;
+                }
+            }
 
             def result = sql """show catalog ${catalog_name}"""
             for (int i = 0; i < result.size(); i++) {

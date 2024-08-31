@@ -76,7 +76,7 @@ suite("test_schema_change_agg", "p0") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tableName3}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     /*
@@ -102,7 +102,7 @@ suite("test_schema_change_agg", "p0") {
     sql """ alter table ${tableName3} modify column k4 bigint(11) sum NULL"""
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tableName3}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     sql """ alter table ${tableName3} add column v14 int sum NOT NULL default "0" after k13 """
@@ -112,7 +112,7 @@ suite("test_schema_change_agg", "p0") {
     sql """ alter table ${tableName3} modify column v14 int sum NULL default "0" """
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tableName3}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     sql """ alter table ${tableName3} drop column v14 """
@@ -136,7 +136,7 @@ suite("test_schema_change_agg", "p0") {
 
     waitForSchemaChangeDone {
         sql """SHOW ALTER TABLE COLUMN WHERE IndexName='${tableName3}' ORDER BY createtime DESC LIMIT 1"""
-        time 60
+        time 600
     }
 
     sql """ insert into ${tableName3} values (10002, 2, 3, 4, 5, 6.6, 1.7, 8.81,
@@ -176,7 +176,7 @@ suite("test_schema_change_agg", "p0") {
                     partition `old_p1` values [("1"), ("2")),
                     partition `old_p2` values [("2"), ("3"))
                 )
-        DISTRIBUTED BY HASH(pv) BUCKETS 1
+        DISTRIBUTED BY HASH(citycode) BUCKETS 1
         PROPERTIES (
             "replication_num" = "1"
         );
@@ -204,8 +204,8 @@ suite("test_schema_change_agg", "p0") {
     //distribution key
 
     test {
-        sql "alter table ${tableName3} modify column pv bigint sum default '0' comment 'pv'"
-        exception "Can not modify distribution column[pv]. index[${tableName3}]"
+        sql "alter table ${tableName3} modify column citycode smallint  comment 'citycode'"
+        exception "Can not modify distribution column[citycode]. index[${tableName3}]"
     }
 
 

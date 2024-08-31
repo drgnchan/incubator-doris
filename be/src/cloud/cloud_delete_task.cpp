@@ -39,6 +39,11 @@ Status CloudDeleteTask::execute(CloudStorageEngine& engine, const TPushReq& requ
 
     auto tablet = DORIS_TRY(engine.tablet_mgr().get_tablet(request.tablet_id));
 
+    if (!request.__isset.schema_version) {
+        return Status::InternalError("No valid schema version in request, tablet_id={}",
+                                     tablet->tablet_id());
+    }
+
     using namespace std::chrono;
     tablet->last_load_time_ms =
             duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -54,7 +59,9 @@ Status CloudDeleteTask::execute(CloudStorageEngine& engine, const TPushReq& requ
     // check delete condition if push for delete
     DeletePredicatePB del_pred;
     auto tablet_schema = std::make_shared<TabletSchema>();
+    // FIXME(plat1ko): Rewrite columns updating logic
     tablet_schema->update_tablet_columns(*tablet->tablet_schema(), request.columns_desc);
+    tablet_schema->set_schema_version(request.schema_version);
     RETURN_IF_ERROR(DeleteHandler::generate_delete_predicate(*tablet_schema,
                                                              request.delete_conditions, &del_pred));
 
@@ -62,7 +69,12 @@ Status CloudDeleteTask::execute(CloudStorageEngine& engine, const TPushReq& requ
     load_id.set_hi(0);
     load_id.set_lo(0);
     RowsetWriterContext context;
-    context.fs = engine.latest_fs();
+    context.storage_resource = engine.get_storage_resource(request.storage_vault_id);
+    if (!context.storage_resource) {
+        return Status::InternalError("vault id not found, maybe not sync, vault id {}",
+                                     request.storage_vault_id);
+    }
+
     context.txn_id = request.transaction_id;
     context.load_id = load_id;
     context.rowset_state = PREPARED;
@@ -77,15 +89,23 @@ Status CloudDeleteTask::execute(CloudStorageEngine& engine, const TPushReq& requ
     RETURN_IF_ERROR(rowset_writer->build(rowset));
     rowset->rowset_meta()->set_delete_predicate(std::move(del_pred));
 
-    auto st = engine.meta_mgr().commit_rowset(*rowset->rowset_meta(), true);
+    auto st = engine.meta_mgr().commit_rowset(*rowset->rowset_meta());
 
     // Update tablet stats
     tablet->fetch_add_approximate_num_rowsets(1);
     tablet->fetch_add_approximate_cumu_num_rowsets(1);
 
-    // TODO(liaoxin): set_tablet_txn_info if enable_unique_key_merge_on_write
+    // TODO(liaoxin) delete operator don't send calculate delete bitmap task from fe,
+    //  then we don't need to set_txn_related_delete_bitmap here.
+    if (tablet->enable_unique_key_merge_on_write()) {
+        DeleteBitmapPtr delete_bitmap = std::make_shared<DeleteBitmap>(tablet->tablet_id());
+        RowsetIdUnorderedSet rowset_ids;
+        engine.txn_delete_bitmap_cache().set_tablet_txn_info(
+                request.transaction_id, tablet->tablet_id(), delete_bitmap, rowset_ids, rowset,
+                request.timeout, nullptr);
+    }
 
-    return Status::OK();
+    return st;
 }
 
 } // namespace doris

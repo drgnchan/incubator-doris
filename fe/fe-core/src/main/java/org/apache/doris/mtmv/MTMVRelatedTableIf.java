@@ -38,7 +38,7 @@ public interface MTMVRelatedTableIf extends TableIf {
      *
      * @return partitionId->PartitionItem
      */
-    Map<Long, PartitionItem> getPartitionItems();
+    Map<String, PartitionItem> getAndCopyPartitionItems();
 
     /**
      * getPartitionType LIST/RANGE/UNPARTITIONED
@@ -65,11 +65,11 @@ public interface MTMVRelatedTableIf extends TableIf {
     /**
      * getPartitionSnapshot
      *
-     * @param partitionId
+     * @param partitionName
      * @return partition snapshot at current time
      * @throws AnalysisException
      */
-    MTMVSnapshotIf getPartitionSnapshot(long partitionId) throws AnalysisException;
+    MTMVSnapshotIf getPartitionSnapshot(String partitionName, MTMVRefreshContext context) throws AnalysisException;
 
     /**
      * getTableSnapshot
@@ -77,22 +77,13 @@ public interface MTMVRelatedTableIf extends TableIf {
      * @return table snapshot at current time
      * @throws AnalysisException
      */
-    MTMVSnapshotIf getTableSnapshot() throws AnalysisException;
-
-    /**
-     * getPartitionName
-     *
-     * @param partitionId
-     * @return partitionName
-     * @throws AnalysisException
-     */
-    String getPartitionName(long partitionId) throws AnalysisException;
+    MTMVSnapshotIf getTableSnapshot(MTMVRefreshContext context) throws AnalysisException;
 
     /**
      * Does the current type of table allow timed triggering
      *
      * @return If return false,The method of comparing whether to synchronize will directly return true,
-     * otherwise the snapshot information will be compared
+     *         otherwise the snapshot information will be compared
      */
     boolean needAutoRefresh();
 

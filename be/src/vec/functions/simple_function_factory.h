@@ -24,8 +24,6 @@
 #include <string>
 
 #include "agent/be_exec_version_manager.h"
-#include "udf/udf.h"
-#include "vec/exprs/table_function/table_function.h"
 #include "vec/functions/function.h"
 
 namespace doris::vectorized {
@@ -35,13 +33,13 @@ class SimpleFunctionFactory;
 void register_function_size(SimpleFunctionFactory& factory);
 void register_function_comparison(SimpleFunctionFactory& factory);
 void register_function_comparison_eq_for_null(SimpleFunctionFactory& factory);
-void register_function_hll_cardinality(SimpleFunctionFactory& factory);
-void register_function_hll_empty(SimpleFunctionFactory& factory);
-void register_function_hll_hash(SimpleFunctionFactory& factory);
+void register_function_hll(SimpleFunctionFactory& factory);
 void register_function_logical(SimpleFunctionFactory& factory);
 void register_function_case(SimpleFunctionFactory& factory);
 void register_function_cast(SimpleFunctionFactory& factory);
+void register_function_encode_varchar(SimpleFunctionFactory& factory);
 void register_function_conv(SimpleFunctionFactory& factory);
+void register_function_decode_as_varchar(SimpleFunctionFactory& factory);
 void register_function_plus(SimpleFunctionFactory& factory);
 void register_function_minus(SimpleFunctionFactory& factory);
 void register_function_multiply(SimpleFunctionFactory& factory);
@@ -50,6 +48,7 @@ void register_function_int_div(SimpleFunctionFactory& factory);
 void register_function_bit(SimpleFunctionFactory& factory);
 void register_function_bit_count(SimpleFunctionFactory& factory);
 void register_function_bit_shift(SimpleFunctionFactory& factory);
+void register_function_round(SimpleFunctionFactory& factory);
 void register_function_math(SimpleFunctionFactory& factory);
 void register_function_modulo(SimpleFunctionFactory& factory);
 void register_function_bitmap(SimpleFunctionFactory& factory);
@@ -65,7 +64,7 @@ void register_function_running_difference(SimpleFunctionFactory& factory);
 void register_function_date_time_to_string(SimpleFunctionFactory& factory);
 void register_function_date_time_string_to_string(SimpleFunctionFactory& factory);
 void register_function_in(SimpleFunctionFactory& factory);
-void register_function_struct_in(SimpleFunctionFactory& factory);
+void register_function_collection_in(SimpleFunctionFactory& factory);
 void register_function_if(SimpleFunctionFactory& factory);
 void register_function_nullif(SimpleFunctionFactory& factory);
 void register_function_date_time_computation(SimpleFunctionFactory& factory);
@@ -81,6 +80,7 @@ void register_function_regexp(SimpleFunctionFactory& factory);
 void register_function_random(SimpleFunctionFactory& factory);
 void register_function_uuid(SimpleFunctionFactory& factory);
 void register_function_uuid_numeric(SimpleFunctionFactory& factory);
+void register_function_uuid_transforms(SimpleFunctionFactory& factory);
 void register_function_coalesce(SimpleFunctionFactory& factory);
 void register_function_grouping(SimpleFunctionFactory& factory);
 void register_function_datetime_floor_ceil(SimpleFunctionFactory& factory);
@@ -97,22 +97,25 @@ void register_function_multi_string_position(SimpleFunctionFactory& factory);
 void register_function_multi_string_search(SimpleFunctionFactory& factory);
 void register_function_width_bucket(SimpleFunctionFactory& factory);
 void register_function_ignore(SimpleFunctionFactory& factory);
-
 void register_function_encryption(SimpleFunctionFactory& factory);
 void register_function_regexp_extract(SimpleFunctionFactory& factory);
 void register_function_hex_variadic(SimpleFunctionFactory& factory);
 void register_function_match(SimpleFunctionFactory& factory);
 void register_function_tokenize(SimpleFunctionFactory& factory);
-
 void register_function_url(SimpleFunctionFactory& factory);
 void register_function_ip(SimpleFunctionFactory& factory);
+void register_function_multi_match(SimpleFunctionFactory& factory);
+void register_function_split_by_regexp(SimpleFunctionFactory& factory);
+void register_function_assert_true(SimpleFunctionFactory& factory);
 
 class SimpleFunctionFactory {
     using Creator = std::function<FunctionBuilderPtr()>;
     using FunctionCreators = phmap::flat_hash_map<std::string, Creator>;
     using FunctionIsVariadic = phmap::flat_hash_set<std::string>;
-    /// @TEMPORARY: for be_exec_version=3
-    constexpr static int NEWEST_VERSION_FUNCTION_SUBSTITUTE = 3;
+    /// @TEMPORARY: for be_exec_version=5.
+    /// whenever change this, please make sure old functions was all cleared. otherwise the version now-1 will think it should do replacement
+    /// which actually should be done by now-2 version.
+    constexpr static int NEWEST_VERSION_FUNCTION_SUBSTITUTE = 5;
 
 public:
     void register_function(const std::string& name, const Creator& ptr) {
@@ -148,10 +151,10 @@ public:
         function_alias[alias] = name;
     }
 
-    /// @TEMPORARY: for be_exec_version=3
+    /// @TEMPORARY: for be_exec_version=4
     template <class Function>
     void register_alternative_function() {
-        static std::string suffix {"_old_for_version_before_3_0"};
+        static std::string suffix {"_old_for_version_before_5_0"};
         function_to_replace[Function::name] = Function::name + suffix;
         register_function(Function::name + suffix, &createDefaultFunction<Function>);
     }
@@ -195,7 +198,7 @@ private:
     FunctionCreators function_creators;
     FunctionIsVariadic function_variadic_set;
     std::unordered_map<std::string, std::string> function_alias;
-    /// @TEMPORARY: for be_exec_version=3. replace function to old version.
+    /// @TEMPORARY: for be_exec_version=4. replace function to old version.
     std::unordered_map<std::string, std::string> function_to_replace;
 
     template <typename Function>
@@ -203,7 +206,7 @@ private:
         return std::make_shared<DefaultFunctionBuilder>(Function::create());
     }
 
-    /// @TEMPORARY: for be_exec_version=3
+    /// @TEMPORARY: for be_exec_version=4
     void temporary_function_update(int fe_version_now, std::string& name) {
         // replace if fe is old version.
         if (fe_version_now < NEWEST_VERSION_FUNCTION_SUBSTITUTE &&
@@ -221,16 +224,17 @@ public:
             register_function_bitmap(instance);
             register_function_quantile_state(instance);
             register_function_bitmap_variadic(instance);
-            register_function_hll_cardinality(instance);
-            register_function_hll_empty(instance);
-            register_function_hll_hash(instance);
+            register_function_hll(instance);
             register_function_comparison(instance);
+            register_function_encode_varchar(instance);
+            register_function_decode_as_varchar(instance);
             register_function_logical(instance);
             register_function_case(instance);
             register_function_cast(instance);
             register_function_conv(instance);
             register_function_plus(instance);
             register_function_minus(instance);
+            register_function_round(instance);
             register_function_math(instance);
             register_function_multiply(instance);
             register_function_divide(instance);
@@ -246,7 +250,7 @@ public:
             register_function_time_of_function(instance);
             register_function_string(instance);
             register_function_in(instance);
-            register_function_struct_in(instance);
+            register_function_collection_in(instance);
             register_function_if(instance);
             register_function_nullif(instance);
             register_function_date_time_computation(instance);
@@ -265,6 +269,7 @@ public:
             register_function_random(instance);
             register_function_uuid(instance);
             register_function_uuid_numeric(instance);
+            register_function_uuid_transforms(instance);
             register_function_coalesce(instance);
             register_function_grouping(instance);
             register_function_datetime_floor_ceil(instance);
@@ -288,6 +293,9 @@ public:
             register_function_tokenize(instance);
             register_function_ignore(instance);
             register_function_variant_element(instance);
+            register_function_multi_match(instance);
+            register_function_split_by_regexp(instance);
+            register_function_assert_true(instance);
         });
         return instance;
     }

@@ -31,7 +31,7 @@ class RowsetMetaPB;
 class TSnapshotRequest;
 struct RowsetId;
 class StorageEngine;
-class MemTracker;
+class MemTrackerLimiter;
 
 class SnapshotManager {
 public:
@@ -53,7 +53,7 @@ public:
 
     Result<std::vector<PendingRowsetGuard>> convert_rowset_ids(const std::string& clone_dir,
                                                                int64_t tablet_id,
-                                                               int64_t replica_id,
+                                                               int64_t replica_id, int64_t table_id,
                                                                int64_t partition_id,
                                                                int32_t schema_hash);
 
@@ -84,7 +84,7 @@ private:
     StorageEngine& _engine;
     std::atomic<uint64_t> _snapshot_base_id {0};
 
-    std::shared_ptr<MemTracker> _mem_tracker;
+    std::shared_ptr<MemTrackerLimiter> _mem_tracker;
 }; // SnapshotManager
 
 } // namespace doris

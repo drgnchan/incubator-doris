@@ -24,7 +24,9 @@ import org.apache.doris.analysis.AggregateInfo;
 import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.FunctionCallExpr;
+import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.SlotId;
+import org.apache.doris.analysis.SortInfo;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.common.NotImplementedException;
 import org.apache.doris.common.UserException;
@@ -63,6 +65,8 @@ public class AggregationNode extends PlanNode {
 
     // If true, use streaming preaggregation algorithm. Not valid if this is a merge agg.
     private boolean useStreamingPreagg;
+
+    private SortInfo sortByGroupKey;
 
     /**
      * Create an agg node that is not an intermediate node.
@@ -287,6 +291,9 @@ public class AggregationNode extends PlanNode {
         msg.agg_node.setUseStreamingPreaggregation(useStreamingPreagg);
         msg.agg_node.setIsFirstPhase(aggInfo.isFirstPhase());
         msg.agg_node.setIsColocate(isColocate);
+        if (sortByGroupKey != null) {
+            msg.agg_node.setAggSortInfoByGroupKey(sortByGroupKey.toThrift());
+        }
         List<Expr> groupingExprs = aggInfo.getGroupingExprs();
         if (groupingExprs != null) {
             msg.agg_node.setGroupingExprs(Expr.treesToThrift(groupingExprs));
@@ -332,6 +339,7 @@ public class AggregationNode extends PlanNode {
         if (!conjuncts.isEmpty()) {
             output.append(detailPrefix).append("having: ").append(getExplainString(conjuncts)).append("\n");
         }
+        output.append(detailPrefix).append("sortByGroupKey:").append(sortByGroupKey != null).append("\n");
         output.append(detailPrefix).append(String.format(
                 "cardinality=%,d", cardinality)).append("\n");
         return output.toString();
@@ -372,6 +380,26 @@ public class AggregationNode extends PlanNode {
             if (!tupleDesc.getMaterializedSlots().isEmpty()) {
                 result.add(tupleDesc.getMaterializedSlots().get(0).getId());
             }
+        } else {
+            // if some input slot for aggregate slot which is not materialized, we need to remove it from the result
+            TupleDescriptor tupleDescriptor = aggInfo.getOutputTupleDesc();
+            ArrayList<SlotDescriptor> slots = tupleDescriptor.getSlots();
+            Set<SlotId> allUnRequestIds = Sets.newHashSet();
+            Set<SlotId> allRequestIds = Sets.newHashSet();
+            for (SlotDescriptor slot : slots) {
+                if (!slot.isMaterialized()) {
+                    List<SlotId> unRequestIds = Lists.newArrayList();
+                    Expr.getIds(slot.getSourceExprs(), null, unRequestIds);
+                    allUnRequestIds.addAll(unRequestIds);
+                } else {
+                    List<SlotId> requestIds = Lists.newArrayList();
+                    Expr.getIds(slot.getSourceExprs(), null, requestIds);
+                    allRequestIds.addAll(requestIds);
+                }
+            }
+            allRequestIds.forEach(allUnRequestIds::remove);
+            groupingSlotIds.forEach(allUnRequestIds::remove);
+            allUnRequestIds.forEach(result::remove);
         }
         return result;
     }
@@ -389,5 +417,14 @@ public class AggregationNode extends PlanNode {
 
     public void setColocate(boolean colocate) {
         isColocate = colocate;
+    }
+
+
+    public boolean isSortByGroupKey() {
+        return sortByGroupKey != null;
+    }
+
+    public void setSortByGroupKey(SortInfo sortByGroupKey) {
+        this.sortByGroupKey = sortByGroupKey;
     }
 }

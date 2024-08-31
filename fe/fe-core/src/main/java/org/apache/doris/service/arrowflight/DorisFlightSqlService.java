@@ -18,7 +18,6 @@
 package org.apache.doris.service.arrowflight;
 
 import org.apache.doris.common.Config;
-import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.service.arrowflight.auth2.FlightBearerTokenAuthenticator;
 import org.apache.doris.service.arrowflight.sessions.FlightSessionsManager;
 import org.apache.doris.service.arrowflight.sessions.FlightSessionsWithTokenManager;
@@ -46,14 +45,22 @@ public class DorisFlightSqlService {
 
     public DorisFlightSqlService(int port) {
         BufferAllocator allocator = new RootAllocator();
-        Location location = Location.forGrpcInsecure(FrontendOptions.getLocalHostAddress(), port);
-        this.flightTokenManager = new FlightTokenManagerImpl(Config.arrow_flight_token_cache_size,
+        Location location = Location.forGrpcInsecure("0.0.0.0", port);
+        // arrow_flight_token_cache_size less than qe_max_connection to avoid `Reach limit of connections`.
+        // arrow flight sql is a stateless protocol, connection is usually not actively disconnected.
+        // bearer token is evict from the cache will unregister ConnectContext.
+        this.flightTokenManager = new FlightTokenManagerImpl(
+                Math.min(Config.arrow_flight_token_cache_size, Config.qe_max_connection / 2),
                 Config.arrow_flight_token_alive_time);
         this.flightSessionsManager = new FlightSessionsWithTokenManager(flightTokenManager);
 
         DorisFlightSqlProducer producer = new DorisFlightSqlProducer(location, flightSessionsManager);
         flightServer = FlightServer.builder(allocator, location, producer)
                 .headerAuthenticator(new FlightBearerTokenAuthenticator(flightTokenManager)).build();
+        LOG.info("Arrow Flight SQL service is created, port: {}, token_cache_size: {}"
+                        + ", qe_max_connection: {}, token_alive_time: {}",
+                port, Config.arrow_flight_token_cache_size, Config.qe_max_connection,
+                Config.arrow_flight_token_alive_time);
     }
 
     // start Arrow Flight SQL service, return true if success, otherwise false

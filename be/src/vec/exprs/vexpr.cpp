@@ -19,9 +19,11 @@
 
 #include <fmt/format.h>
 #include <gen_cpp/Exprs_types.h>
+#include <gen_cpp/FrontendService_types.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
 #include <algorithm>
+#include <boost/algorithm/string/split.hpp>
 #include <boost/iterator/iterator_facade.hpp>
 #include <memory>
 #include <stack>
@@ -29,9 +31,11 @@
 #include "common/config.h"
 #include "common/exception.h"
 #include "common/status.h"
+#include "runtime/define_primitive_type.h"
 #include "vec/columns/column_vector.h"
 #include "vec/columns/columns_number.h"
 #include "vec/data_types/data_type_factory.hpp"
+#include "vec/data_types/data_type_nullable.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/exprs/varray_literal.h"
 #include "vec/exprs/vcase_expr.h"
@@ -101,7 +105,7 @@ TExprNode create_texpr_node_from(const void* data, const PrimitiveType& type, in
         break;
     }
     case TYPE_DATETIMEV2: {
-        THROW_IF_ERROR(create_texpr_literal_node<TYPE_DATETIMEV2>(data, &node));
+        THROW_IF_ERROR(create_texpr_literal_node<TYPE_DATETIMEV2>(data, &node, precision, scale));
         break;
     }
     case TYPE_DATE: {
@@ -144,9 +148,17 @@ TExprNode create_texpr_node_from(const void* data, const PrimitiveType& type, in
         THROW_IF_ERROR(create_texpr_literal_node<TYPE_STRING>(data, &node));
         break;
     }
+    case TYPE_IPV4: {
+        THROW_IF_ERROR(create_texpr_literal_node<TYPE_IPV4>(data, &node));
+        break;
+    }
+    case TYPE_IPV6: {
+        THROW_IF_ERROR(create_texpr_literal_node<TYPE_IPV6>(data, &node));
+        break;
+    }
     default:
-        DCHECK(false);
-        throw std::invalid_argument("Invalid type!");
+        throw Exception(ErrorCode::INTERNAL_ERROR, "runtime filter meet invalid type {}",
+                        int(type));
     }
     return node;
 }
@@ -207,6 +219,7 @@ Status VExpr::prepare(RuntimeState* state, const RowDescriptor& row_desc, VExprC
         RETURN_IF_ERROR(i->prepare(state, row_desc, context));
     }
     --context->_depth_num;
+    _enable_inverted_index_query = state->query_options().enable_inverted_index_query;
     return Status::OK();
 }
 
@@ -279,6 +292,7 @@ Status VExpr::create_expr(const TExprNode& expr_node, VExprSPtr& expr) {
         }
         case TExprNodeType::ARITHMETIC_EXPR:
         case TExprNodeType::BINARY_PRED:
+        case TExprNodeType::NULL_AWARE_BINARY_PRED:
         case TExprNodeType::FUNCTION_CALL:
         case TExprNodeType::COMPUTE_FUNCTION_CALL: {
             expr = VectorizedFnCall::create_shared(expr_node);
@@ -402,6 +416,39 @@ Status VExpr::create_expr_trees(const std::vector<TExpr>& texprs, VExprContextSP
         VExprContextSPtr ctx;
         RETURN_IF_ERROR(create_expr_tree(texpr, ctx));
         ctxs.push_back(ctx);
+    }
+    return Status::OK();
+}
+
+Status VExpr::check_expr_output_type(const VExprContextSPtrs& ctxs,
+                                     const RowDescriptor& output_row_desc) {
+    if (ctxs.empty()) {
+        return Status::OK();
+    }
+    auto name_and_types = VectorizedUtils::create_name_and_data_types(output_row_desc);
+    if (ctxs.size() != name_and_types.size()) {
+        return Status::InternalError(
+                "output type size not match expr size {} , expected output size {} ", ctxs.size(),
+                name_and_types.size());
+    }
+    auto check_type_can_be_converted = [](DataTypePtr& from, DataTypePtr& to) -> bool {
+        if (to->equals(*from)) {
+            return true;
+        }
+        if (to->is_nullable() && !from->is_nullable()) {
+            return remove_nullable(to)->equals(*from);
+        }
+        return false;
+    };
+    for (int i = 0; i < ctxs.size(); i++) {
+        auto real_expr_type = ctxs[i]->root()->data_type();
+        auto&& [name, expected_type] = name_and_types[i];
+        if (!check_type_can_be_converted(real_expr_type, expected_type)) {
+            return Status::InternalError(
+                    "output type not match expr type  , col name {} , expected type {} , real type "
+                    "{}",
+                    name, expected_type->get_name(), real_expr_type->get_name());
+        }
     }
     return Status::OK();
 }
@@ -541,10 +588,10 @@ void VExpr::close_function_context(VExprContext* context, FunctionContext::Funct
                                    const FunctionBasePtr& function) const {
     if (_fn_context_index != -1) {
         FunctionContext* fn_ctx = context->fn_context(_fn_context_index);
-        // close failed will make system unstable. dont swallow it.
-        THROW_IF_ERROR(function->close(fn_ctx, FunctionContext::THREAD_LOCAL));
+        // `close_function_context` is called in VExprContext's destructor so do not throw exceptions here.
+        static_cast<void>(function->close(fn_ctx, FunctionContext::THREAD_LOCAL));
         if (scope == FunctionContext::FRAGMENT_LOCAL) {
-            THROW_IF_ERROR(function->close(fn_ctx, FunctionContext::FRAGMENT_LOCAL));
+            static_cast<void>(function->close(fn_ctx, FunctionContext::FRAGMENT_LOCAL));
         }
     }
 }
@@ -562,6 +609,86 @@ Status VExpr::get_result_from_const(vectorized::Block* block, const std::string&
     auto column = ColumnConst::create(_constant_col->column_ptr, block->rows());
     block->insert({std::move(column), _data_type, expr_name});
     return Status::OK();
+}
+
+bool VExpr::fast_execute(Block& block, const ColumnNumbers& arguments, size_t result,
+                         size_t input_rows_count, const std::string& function_name) {
+    if (!_enable_inverted_index_query) {
+        return false;
+    }
+
+    std::string result_column_name = gen_predicate_result_sign(block, arguments, function_name);
+    if (!block.has(result_column_name)) {
+        DBUG_EXECUTE_IF("segment_iterator.fast_execute", {
+            auto debug_col_name = DebugPoints::instance()->get_debug_param_or_default<std::string>(
+                    "segment_iterator._read_columns_by_index", "column_name", "");
+
+            std::vector<std::string> column_names;
+            boost::split(column_names, debug_col_name, boost::algorithm::is_any_of(","));
+
+            std::string column_name = block.get_by_position(arguments[0]).name;
+            auto it = std::find(column_names.begin(), column_names.end(), column_name);
+            if (it == column_names.end()) {
+                return Status::Error<ErrorCode::INTERNAL_ERROR>("fast_execute failed: {}",
+                                                                result_column_name);
+            }
+        })
+        return false;
+    }
+
+    auto result_column =
+            block.get_by_name(result_column_name).column->convert_to_full_column_if_const();
+    auto& result_info = block.get_by_position(result);
+    if (result_info.type->is_nullable()) {
+        block.replace_by_position(result,
+                                  ColumnNullable::create(std::move(result_column),
+                                                         ColumnUInt8::create(input_rows_count, 0)));
+    } else {
+        block.replace_by_position(result, std::move(result_column));
+    }
+
+    return true;
+}
+
+std::string VExpr::gen_predicate_result_sign(Block& block, const ColumnNumbers& arguments,
+                                             const std::string& function_name) const {
+    std::string pred_result_sign;
+    if (this->fn().name.function_name == "multi_match") {
+        pred_result_sign =
+                BeConsts::BLOCK_TEMP_COLUMN_PREFIX + std::to_string(this->index_unique_id());
+    } else {
+        std::string column_name = block.get_by_position(arguments[0]).name;
+        pred_result_sign +=
+                BeConsts::BLOCK_TEMP_COLUMN_PREFIX + column_name + "_" + function_name + "_";
+        if (function_name == "in" || function_name == "not_in") {
+            if (arguments.size() - 1 > _in_list_value_count_threshold) {
+                return pred_result_sign;
+            }
+            // Generating 'result_sign' from 'inlist' requires sorting the values.
+            std::set<std::string> values;
+            for (size_t i = 1; i < arguments.size(); i++) {
+                const auto& entry = block.get_by_position(arguments[i]);
+                if (!is_column_const(*entry.column)) {
+                    return pred_result_sign;
+                }
+                values.insert(entry.type->to_string(*entry.column, 0));
+            }
+            pred_result_sign += boost::join(values, ",");
+        } else if (function_name == "collection_in" || function_name == "collection_not_in") {
+            return pred_result_sign;
+        } else {
+            const auto& entry = block.get_by_position(arguments[1]);
+            if (!is_column_const(*entry.column)) {
+                return pred_result_sign;
+            }
+            pred_result_sign += entry.type->to_string(*entry.column, 0);
+        }
+    }
+    return pred_result_sign;
+}
+
+bool VExpr::equals(const VExpr& other) {
+    return false;
 }
 
 } // namespace doris::vectorized

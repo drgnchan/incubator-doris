@@ -21,37 +21,11 @@
 
 #include "common/status.h"
 #include "operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/vset_operation_node.h"
 
 namespace doris {
-class ExecNode;
 class RuntimeState;
 
 namespace pipeline {
-
-template <bool is_intersect>
-class SetSourceOperatorBuilder
-        : public OperatorBuilder<vectorized::VSetOperationNode<is_intersect>> {
-private:
-    constexpr static auto builder_name =
-            is_intersect ? "IntersectSourceOperator" : "ExceptSourceOperator";
-
-public:
-    SetSourceOperatorBuilder(int32_t id, ExecNode* set_node);
-    [[nodiscard]] bool is_source() const override { return true; }
-
-    OperatorPtr build_operator() override;
-};
-
-template <bool is_intersect>
-class SetSourceOperator : public SourceOperator<vectorized::VSetOperationNode<is_intersect>> {
-public:
-    SetSourceOperator(OperatorBuilderBase* builder,
-                      vectorized::VSetOperationNode<is_intersect>* set_node);
-
-    Status open(RuntimeState* /*state*/) override { return Status::OK(); }
-};
 
 template <bool is_intersect>
 class SetSourceOperatorX;
@@ -85,7 +59,10 @@ public:
 
     SetSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
                        const DescriptorTbl& descs)
-            : Base(pool, tnode, operator_id, descs) {};
+            : Base(pool, tnode, operator_id, descs),
+              _child_quantity(tnode.node_type == TPlanNodeType::type::INTERSECT_NODE
+                                      ? tnode.intersect_node.result_expr_lists.size()
+                                      : tnode.except_node.result_expr_lists.size()) {};
     ~SetSourceOperatorX() override = default;
 
     [[nodiscard]] bool is_source() const override { return true; }
@@ -104,7 +81,8 @@ private:
                                   const int batch_size, bool* eos);
 
     void _add_result_columns(SetSourceLocalState<is_intersect>& local_state,
-                             vectorized::RowRefListWithFlags& value, int& block_size);
+                             RowRefListWithFlags& value, int& block_size);
+    const int _child_quantity;
 };
 
 } // namespace pipeline

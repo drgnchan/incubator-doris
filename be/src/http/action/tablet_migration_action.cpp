@@ -40,10 +40,10 @@ const static std::string HEADER_JSON = "application/json";
 void TabletMigrationAction::_init_migration_action() {
     int32_t max_thread_num = config::max_tablet_migration_threads;
     int32_t min_thread_num = config::min_tablet_migration_threads;
-    static_cast<void>(ThreadPoolBuilder("MigrationTaskThreadPool")
-                              .set_min_threads(min_thread_num)
-                              .set_max_threads(max_thread_num)
-                              .build(&_migration_thread_pool));
+    THROW_IF_ERROR(ThreadPoolBuilder("MigrationTaskThreadPool")
+                           .set_min_threads(min_thread_num)
+                           .set_max_threads(max_thread_num)
+                           .build(&_migration_thread_pool));
 }
 
 void TabletMigrationAction::handle(HttpRequest* req) {
@@ -74,7 +74,8 @@ void TabletMigrationAction::handle(HttpRequest* req) {
                         }
                         _migration_tasks[current_task] = "submitted";
                     }
-                    auto st = _migration_thread_pool->submit_func([&, dest_disk, current_task]() {
+                    auto st = _migration_thread_pool->submit_func([&, tablet, dest_store,
+                                                                   current_task]() {
                         {
                             std::unique_lock<std::mutex> lock(_migration_status_mutex);
                             _migration_tasks[current_task] = "running";
@@ -224,6 +225,7 @@ Status TabletMigrationAction::_execute_tablet_migration(TabletSharedPtr tablet,
     int32_t schema_hash = tablet->schema_hash();
     string dest_disk = dest_store->path();
     EngineStorageMigrationTask engine_task(_engine, tablet, dest_store);
+    SCOPED_ATTACH_TASK(engine_task.mem_tracker());
     Status res = engine_task.execute();
     if (!res.ok()) {
         LOG(WARNING) << "tablet migrate failed. tablet_id=" << tablet_id

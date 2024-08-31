@@ -21,6 +21,8 @@ import org.apache.doris.analysis.CreateDbStmt;
 import org.apache.doris.analysis.CreateTableStmt;
 import org.apache.doris.analysis.DropDbStmt;
 import org.apache.doris.analysis.DropTableStmt;
+import org.apache.doris.analysis.TableName;
+import org.apache.doris.analysis.TruncateTableStmt;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.TableIf;
@@ -39,7 +41,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import javax.annotation.Nullable;
 
@@ -176,18 +177,24 @@ public interface CatalogIf<T extends DatabaseIf> {
         return log;
     }
 
+    TableName getTableNameByTableId(Long tableId);
+
     // Return a copy of all db collection.
     Collection<DatabaseIf<? extends TableIf>> getAllDbs();
 
     boolean enableAutoAnalyze();
 
-    ConcurrentHashMap<Long, DatabaseIf> getIdToDb();
-
     void createDb(CreateDbStmt stmt) throws DdlException;
 
     void dropDb(DropDbStmt stmt) throws DdlException;
 
-    void createTable(CreateTableStmt stmt) throws UserException;
+    /**
+     * @return if org.apache.doris.analysis.CreateTableStmt.ifNotExists is true, return true if table exists,
+     * return false otherwise
+     */
+    boolean createTable(CreateTableStmt stmt) throws UserException;
 
     void dropTable(DropTableStmt stmt) throws DdlException;
+
+    void truncateTable(TruncateTableStmt truncateTableStmt) throws DdlException;
 }

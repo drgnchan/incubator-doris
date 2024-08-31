@@ -19,12 +19,14 @@ package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.AlterColocateGroupStmt;
 import org.apache.doris.clone.ColocateTableCheckerAndBalancer;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.FeMetaVersion;
 import org.apache.doris.common.MetaNotFoundException;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
+import org.apache.doris.common.lock.MonitoredReentrantReadWriteLock;
 import org.apache.doris.common.util.DynamicPartitionUtil;
 import org.apache.doris.common.util.PropertyAnalyzer;
 import org.apache.doris.persist.ColocatePersistInfo;
@@ -56,7 +58,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
 /**
@@ -182,7 +183,7 @@ public class ColocateTableIndex implements Writable {
     // save some error msg of the group for show. no need to persist
     private Map<GroupId, String> group2ErrMsgs = Maps.newHashMap();
 
-    private transient ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private transient MonitoredReentrantReadWriteLock lock = new MonitoredReentrantReadWriteLock();
 
     public ColocateTableIndex() {
 
@@ -429,7 +430,7 @@ public class ColocateTableIndex implements Writable {
     public Set<GroupId> getAllGroupIds() {
         readLock();
         try {
-            return group2Tables.keySet();
+            return Sets.newHashSet(group2Tables.keySet());
         } finally {
             readUnlock();
         }
@@ -845,6 +846,10 @@ public class ColocateTableIndex implements Writable {
 
             if (properties.containsKey(PropertyAnalyzer.PROPERTIES_REPLICATION_NUM)
                     || properties.containsKey(PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION)) {
+                if (Config.isCloudMode()) {
+                    throw new DdlException("Cann't modify colocate group replication in cloud mode");
+                }
+
                 ReplicaAllocation replicaAlloc = PropertyAnalyzer.analyzeReplicaAllocation(properties, "");
                 Preconditions.checkState(!replicaAlloc.isNotSet());
                 Env.getCurrentSystemInfo().checkReplicaAllocation(replicaAlloc);

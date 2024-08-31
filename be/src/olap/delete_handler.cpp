@@ -21,12 +21,7 @@
 #include <gen_cpp/olap_file.pb.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
-#include <algorithm>
-#include <boost/regex.hpp>
-#include <limits>
-#include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "common/config.h"
@@ -38,22 +33,66 @@
 #include "olap/predicate_creator.h"
 #include "olap/tablet_schema.h"
 #include "olap/utils.h"
+#include "util/debug_points.h"
 
 using apache::thrift::ThriftDebugString;
 using std::vector;
 using std::string;
-using std::stringstream;
 
 using ::google::protobuf::RepeatedPtrField;
 
 namespace doris {
-using namespace ErrorCode;
+
+// construct sub condition from TCondition
+std::string construct_sub_predicate(const TCondition& condition) {
+    string op = condition.condition_op;
+    if (op == "<") {
+        op += "<";
+    } else if (op == ">") {
+        op += ">";
+    }
+    string condition_str;
+    if ("IS" == op) {
+        // ATTN: tricky! Surround IS with spaces to make it "special"
+        condition_str = condition.column_name + " IS " + condition.condition_values[0];
+    } else { // multi-elements IN expr has been processed with InPredicatePB
+        if (op == "*=") {
+            op = "=";
+        } else if (op == "!*=") {
+            op = "!=";
+        }
+        condition_str = condition.column_name + op + "'" + condition.condition_values[0] + "'";
+    }
+    return condition_str;
+}
+
+// make operators from FE adaptive to BE
+std::string trans_op(const std::string& opt) {
+    std::string op = string(opt);
+    if (op == "<") {
+        op += "<";
+    } else if (op == ">") {
+        op += ">";
+    }
+    if ("IS" != op) {
+        if (op == "*=") {
+            op = "=";
+        } else if (op == "!*=") {
+            op = "!=";
+        }
+    }
+    return op;
+}
 
 Status DeleteHandler::generate_delete_predicate(const TabletSchema& schema,
                                                 const std::vector<TCondition>& conditions,
                                                 DeletePredicatePB* del_pred) {
+    DBUG_EXECUTE_IF("DeleteHandler::generate_delete_predicate.inject_failure", {
+        return Status::Error<false>(dp->param<int>("error_code"),
+                                    dp->param<std::string>("error_msg"));
+    })
     if (conditions.empty()) {
-        return Status::Error<DELETE_INVALID_PARAMETERS>(
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>(
                 "invalid parameters for store_cond. condition_size={}", conditions.size());
     }
 
@@ -80,11 +119,21 @@ Status DeleteHandler::generate_delete_predicate(const TabletSchema& schema,
                       << "condition size=" << in_pred->values().size();
         } else {
             // write sub predicate v1 for compactbility
-            del_pred->add_sub_predicates(construct_sub_predicate(condition));
+            std::string condition_str = construct_sub_predicate(condition);
+            VLOG_NOTICE << __PRETTY_FUNCTION__ << " condition_str: " << condition_str;
+            del_pred->add_sub_predicates(condition_str);
             DeleteSubPredicatePB* sub_predicate = del_pred->add_sub_predicates_v2();
             if (condition.__isset.column_unique_id) {
+                // only light schema change capable table set this field
                 sub_predicate->set_column_unique_id(condition.column_unique_id);
+            } else if (TCondition tmp; !DeleteHandler::parse_condition(condition_str, &tmp)) {
+                // for non light shema change tables, check regex match for condition str
+                LOG(WARNING) << "failed to parse condition_str, condtion="
+                             << ThriftDebugString(condition);
+                return Status::Error<ErrorCode::INVALID_ARGUMENT>(
+                        "failed to parse condition_str, condtion={}", ThriftDebugString(condition));
             }
+
             sub_predicate->set_column_name(condition.column_name);
             sub_predicate->set_op(trans_op(condition.condition_op));
             sub_predicate->set_cond_value(condition.condition_values[0]);
@@ -98,14 +147,15 @@ Status DeleteHandler::generate_delete_predicate(const TabletSchema& schema,
     return Status::OK();
 }
 
-void DeleteHandler::convert_to_sub_pred_v2(DeletePredicatePB* delete_pred,
-                                           TabletSchemaSPtr schema) {
+Status DeleteHandler::convert_to_sub_pred_v2(DeletePredicatePB* delete_pred,
+                                             TabletSchemaSPtr schema) {
     if (!delete_pred->sub_predicates().empty() && delete_pred->sub_predicates_v2().empty()) {
         for (const auto& condition_str : delete_pred->sub_predicates()) {
             auto* sub_pred = delete_pred->add_sub_predicates_v2();
             TCondition condition;
             static_cast<void>(parse_condition(condition_str, &condition));
-            sub_pred->set_column_unique_id(schema->column(condition.column_name).unique_id());
+            const auto& column = *DORIS_TRY(schema->column(condition.column_name));
+            sub_pred->set_column_unique_id(column.unique_id());
             sub_pred->set_column_name(condition.column_name);
             sub_pred->set_op(condition.condition_op);
             sub_pred->set_cond_value(condition.condition_values[0]);
@@ -114,46 +164,10 @@ void DeleteHandler::convert_to_sub_pred_v2(DeletePredicatePB* delete_pred,
 
     auto* in_pred_list = delete_pred->mutable_in_predicates();
     for (auto& in_pred : *in_pred_list) {
-        in_pred.set_column_unique_id(schema->column(in_pred.column_name()).unique_id());
+        const auto& column = *DORIS_TRY(schema->column(in_pred.column_name()));
+        in_pred.set_column_unique_id(column.unique_id());
     }
-}
-
-std::string DeleteHandler::construct_sub_predicate(const TCondition& condition) {
-    string op = condition.condition_op;
-    if (op == "<") {
-        op += "<";
-    } else if (op == ">") {
-        op += ">";
-    }
-    string condition_str;
-    if ("IS" == op) {
-        condition_str = condition.column_name + " " + op + " " + condition.condition_values[0];
-    } else {
-        if (op == "*=") {
-            op = "=";
-        } else if (op == "!*=") {
-            op = "!=";
-        }
-        condition_str = condition.column_name + op + "'" + condition.condition_values[0] + "'";
-    }
-    return condition_str;
-}
-
-std::string DeleteHandler::trans_op(const std::string& opt) {
-    std::string op = string(opt);
-    if (op == "<") {
-        op += "<";
-    } else if (op == ">") {
-        op += ">";
-    }
-    if ("IS" != op) {
-        if (op == "*=") {
-            op = "=";
-        } else if (op == "!*=") {
-            op = "!=";
-        }
-    }
-    return op;
+    return Status::OK();
 }
 
 bool DeleteHandler::is_condition_value_valid(const TabletColumn& column,
@@ -219,8 +233,8 @@ Status DeleteHandler::check_condition_valid(const TabletSchema& schema, const TC
     // Check whether the column exists
     int32_t field_index = schema.field_index(cond.column_name);
     if (field_index < 0) {
-        return Status::Error<DELETE_INVALID_CONDITION>("field is not existent. [field_index={}]",
-                                                       field_index);
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>("field is not existent. [field_index={}]",
+                                                          field_index);
     }
 
     // Delete condition should only applied on key columns or duplicate key table, and
@@ -229,21 +243,21 @@ Status DeleteHandler::check_condition_valid(const TabletSchema& schema, const TC
 
     if (column.type() == FieldType::OLAP_FIELD_TYPE_DOUBLE ||
         column.type() == FieldType::OLAP_FIELD_TYPE_FLOAT) {
-        return Status::Error<DELETE_INVALID_CONDITION>("data type is float or double.");
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>("data type is float or double.");
     }
 
     // Check operator and operands size are matched.
     if ("*=" != cond.condition_op && "!*=" != cond.condition_op &&
         cond.condition_values.size() != 1) {
-        return Status::Error<DELETE_INVALID_CONDITION>("invalid condition value size. [size={}]",
-                                                       cond.condition_values.size());
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>("invalid condition value size. [size={}]",
+                                                          cond.condition_values.size());
     }
 
     // Check each operand is valid
     for (const auto& condition_value : cond.condition_values) {
         if (!is_condition_value_valid(column, cond.condition_op, condition_value)) {
-            return Status::Error<DELETE_INVALID_CONDITION>("invalid condition value. [value={}]",
-                                                           condition_value);
+            return Status::Error<ErrorCode::INVALID_ARGUMENT>("invalid condition value. [value={}]",
+                                                              condition_value);
         }
     }
 
@@ -257,15 +271,16 @@ Status DeleteHandler::check_condition_valid(const TabletSchema& schema, const TC
         const auto& err_msg =
                 fmt::format("column id does not exists in table={}, schema version={},",
                             schema.table_id(), schema.schema_version());
-        return Status::Error<DELETE_INVALID_CONDITION>(err_msg);
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>(err_msg);
     }
     if (!iequal(schema.column_by_uid(cond.column_unique_id).name(), cond.column_name)) {
         const auto& err_msg = fmt::format(
-                "colum name={} does not belongs to column uid={}, which column name={}, "
+                "colum name={} does not belongs to column uid={}, which "
+                "column name={}, "
                 "delete_cond.column_name ={}",
                 cond.column_name, cond.column_unique_id,
                 schema.column_by_uid(cond.column_unique_id).name(), cond.column_name);
-        return Status::Error<DELETE_INVALID_CONDITION>(err_msg);
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>(err_msg);
     }
 
     return Status::OK();
@@ -273,7 +288,7 @@ Status DeleteHandler::check_condition_valid(const TabletSchema& schema, const TC
 
 Status DeleteHandler::parse_condition(const DeleteSubPredicatePB& sub_cond, TCondition* condition) {
     if (!sub_cond.has_column_name() || !sub_cond.has_op() || !sub_cond.has_cond_value()) {
-        return Status::Error<DELETE_INVALID_PARAMETERS>(
+        return Status::Error<ErrorCode::INVALID_ARGUMENT>(
                 "fail to parse condition. condition={} {} {}", sub_cond.column_name(),
                 sub_cond.op(), sub_cond.cond_value());
     }
@@ -286,44 +301,47 @@ Status DeleteHandler::parse_condition(const DeleteSubPredicatePB& sub_cond, TCon
     return Status::OK();
 }
 
-Status DeleteHandler::parse_condition(const std::string& condition_str, TCondition* condition) {
-    bool matched = true;
-    boost::smatch what;
+// clang-format off
+// Condition string format, the format is (column_name)(op)(value)
+// eg: condition_str="c1 = 1597751948193618247 and length(source)<1;\n;\n"
+// column_name: matches "c1", must include FeNameFormat.java COLUMN_NAME_REGEX
+//              and compactible with any the lagacy
+// operator: matches "="
+// value: matches "1597751948193618247  and length(source)<1;\n;\n"
+//
+// For more info, see DeleteHandler::construct_sub_predicates
+// FIXME(gavin): This is a tricky implementation, it should not be the final resolution, refactor it.
+const char* const CONDITION_STR_PATTERN =
+    // .----------------- column-name --------------------------.   .----------------------- operator ------------------------.   .------------ value ----------.
+    R"(([_a-zA-Z@0-9\s/\p{L}][.a-zA-Z0-9_+-/?@#$%^&*"\s,:\p{L}]*)\s*((?:=)|(?:!=)|(?:>>)|(?:<<)|(?:>=)|(?:<=)|(?:\*=)|(?: IS ))\s*('((?:[\s\S]+)?)'|(?:[\s\S]+)?))";
+    // '----------------- group 1 ------------------------------'   '--------------------- group 2 ---------------------------'   | '-- group 4--'              |
+    //                                                                   match any of: = != >> << >= <= *= " IS "                 '----------- group 3 ---------'
+    //                                                                                                                             match **ANY THING** without(4)
+    //                                                                                                                             or with(3) single quote
+// clang-format on
+RE2 DELETE_HANDLER_REGEX(CONDITION_STR_PATTERN);
 
-    try {
-        // Condition string format, the format is (column_name)(op)(value)
-        // eg:  condition_str="c1 = 1597751948193618247  and length(source)<1;\n;\n"
-        //  group1:  (\w+) matches "c1"
-        //  group2:  ((?:=)|(?:!=)|(?:>>)|(?:<<)|(?:>=)|(?:<=)|(?:\*=)|(?:IS)) matches  "="
-        //  group3:  ((?:[\s\S]+)?) matches "1597751948193618247  and length(source)<1;\n;\n"
-        const char* const CONDITION_STR_PATTERN =
-                R"(([\w$#%]+)\s*((?:=)|(?:!=)|(?:>>)|(?:<<)|(?:>=)|(?:<=)|(?:\*=)|(?:IS))\s*('((?:[\s\S]+)?)'|(?:[\s\S]+)?))";
-        boost::regex ex(CONDITION_STR_PATTERN);
-        if (boost::regex_match(condition_str, what, ex)) {
-            if (condition_str.size() != what[0].str().size()) {
-                matched = false;
-            }
-        } else {
-            matched = false;
-        }
-    } catch (boost::regex_error& e) {
-        VLOG_NOTICE << "fail to parse expr. [expr=" << condition_str << "; error=" << e.what()
-                    << "]";
-        matched = false;
-    }
+Status DeleteHandler::parse_condition(const std::string& condition_str, TCondition* condition) {
+    std::string col_name, op, value, g4;
+
+    bool matched = RE2::FullMatch(condition_str, DELETE_HANDLER_REGEX, &col_name, &op, &value,
+                                  &g4); // exact match
 
     if (!matched) {
-        return Status::Error<DELETE_INVALID_PARAMETERS>("fail to sub condition. condition={}",
-                                                        condition_str);
-    }
-    condition->column_name = what[1].str();
-    condition->condition_op = what[2].str();
-    if (what[4].matched) { // match string with single quotes, eg. a = 'b'
-        condition->condition_values.push_back(what[4].str());
-    } else { // match string without quote, compat with old conditions, eg. a = b
-        condition->condition_values.push_back(what[3].str());
+        return Status::InvalidArgument("fail to sub condition. condition={}", condition_str);
     }
 
+    condition->column_name = col_name;
+    condition->condition_op = op == " IS " ? "IS" : op;
+    // match string with single quotes, a = b  or a = 'b'
+    if (!g4.empty()) {
+        condition->condition_values.push_back(g4);
+    } else {
+        condition->condition_values.push_back(value);
+    }
+    VLOG_NOTICE << "parsed condition_str: col_name={" << condition->column_name << "} op={"
+                << condition->condition_op << "} val={" << condition->condition_values.back()
+                << "}";
     return Status::OK();
 }
 
@@ -339,7 +357,9 @@ Status DeleteHandler::_parse_column_pred(TabletSchemaSPtr complete_schema,
         if constexpr (std::is_same_v<SubPredType, DeletePredicatePB>) {
             col_unique_id = sub_predicate.col_unique_id;
         } else {
-            col_unique_id = delete_pred_related_schema->column(condition.column_name).unique_id();
+            const auto& column =
+                    *DORIS_TRY(delete_pred_related_schema->column(condition.column_name));
+            col_unique_id = column.unique_id();
         }
         condition.__set_column_unique_id(col_unique_id);
         const auto& column = complete_schema->column_by_uid(col_unique_id);
@@ -380,7 +400,7 @@ Status DeleteHandler::init(TabletSchemaSPtr tablet_schema,
         const auto& delete_condition = delete_pred->delete_predicate();
         DeleteConditions temp;
         temp.filter_version = delete_pred->version().first;
-        if (with_sub_pred_v2) {
+        if (with_sub_pred_v2 && !delete_condition.sub_predicates_v2().empty()) {
             RETURN_IF_ERROR(_parse_column_pred(tablet_schema, delete_pred_related_schema,
                                                delete_condition.sub_predicates_v2(), &temp));
         } else {
@@ -416,7 +436,7 @@ Status DeleteHandler::init(TabletSchemaSPtr tablet_schema,
     return Status::OK();
 }
 
-void DeleteHandler::finalize() {
+DeleteHandler::~DeleteHandler() {
     if (!_is_inited) {
         return;
     }
@@ -440,10 +460,10 @@ void DeleteHandler::get_delete_conditions_after_version(
             // now, only query support delete column predicate operator
             if (!del_cond.column_predicate_vec.empty()) {
                 if (del_cond.column_predicate_vec.size() == 1) {
-                    auto* single_column_block_predicate =
-                            new SingleColumnBlockPredicate(del_cond.column_predicate_vec[0]);
+                    auto single_column_block_predicate = SingleColumnBlockPredicate::create_unique(
+                            del_cond.column_predicate_vec[0]);
                     and_block_column_predicate_ptr->add_column_predicate(
-                            single_column_block_predicate);
+                            std::move(single_column_block_predicate));
                     if (del_predicates_for_zone_map->count(
                                 del_cond.column_predicate_vec[0]->column_id()) < 1) {
                         del_predicates_for_zone_map->insert(
@@ -453,7 +473,7 @@ void DeleteHandler::get_delete_conditions_after_version(
                     (*del_predicates_for_zone_map)[del_cond.column_predicate_vec[0]->column_id()]
                             .push_back(del_cond.column_predicate_vec[0]);
                 } else {
-                    auto* or_column_predicate = new OrBlockColumnPredicate();
+                    auto or_column_predicate = OrBlockColumnPredicate::create_unique();
 
                     // build or_column_predicate
                     // when delete from where a = 1 and b = 2, we can not use del_predicates_for_zone_map to filter zone page,
@@ -464,9 +484,10 @@ void DeleteHandler::get_delete_conditions_after_version(
                                   del_cond.column_predicate_vec.cend(),
                                   [&or_column_predicate](const ColumnPredicate* predicate) {
                                       or_column_predicate->add_column_predicate(
-                                              new SingleColumnBlockPredicate(predicate));
+                                              SingleColumnBlockPredicate::create_unique(predicate));
                                   });
-                    and_block_column_predicate_ptr->add_column_predicate(or_column_predicate);
+                    and_block_column_predicate_ptr->add_column_predicate(
+                            std::move(or_column_predicate));
                 }
             }
         }

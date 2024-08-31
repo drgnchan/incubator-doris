@@ -25,6 +25,7 @@
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/aggregate_functions/aggregate_function_simple_factory.h"
 #include "vec/columns/column_string.h"
+#include "vec/common/assert_cast.h"
 #include "vec/common/string_ref.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type_string.h"
@@ -98,7 +99,8 @@ struct AggregateFunctionGroupConcatImplStr {
     static const std::string separator;
     static void add(AggregateFunctionGroupConcatData& __restrict place, const IColumn** columns,
                     size_t row_num) {
-        place.add(assert_cast<const ColumnString&>(*columns[0]).get_data_at(row_num),
+        place.add(assert_cast<const ColumnString&, TypeCheckOnRelease::DISABLE>(*columns[0])
+                          .get_data_at(row_num),
                   StringRef(separator.data(), separator.length()));
     }
 };
@@ -106,8 +108,10 @@ struct AggregateFunctionGroupConcatImplStr {
 struct AggregateFunctionGroupConcatImplStrStr {
     static void add(AggregateFunctionGroupConcatData& __restrict place, const IColumn** columns,
                     size_t row_num) {
-        place.add(assert_cast<const ColumnString&>(*columns[0]).get_data_at(row_num),
-                  assert_cast<const ColumnString&>(*columns[1]).get_data_at(row_num));
+        place.add(assert_cast<const ColumnString&, TypeCheckOnRelease::DISABLE>(*columns[0])
+                          .get_data_at(row_num),
+                  assert_cast<const ColumnString&, TypeCheckOnRelease::DISABLE>(*columns[1])
+                          .get_data_at(row_num));
     }
 };
 
@@ -124,7 +128,7 @@ public:
 
     DataTypePtr get_return_type() const override { return std::make_shared<DataTypeString>(); }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
         Impl::add(this->data(place), columns, row_num);
     }

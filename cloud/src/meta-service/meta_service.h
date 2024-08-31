@@ -23,14 +23,12 @@
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
 
-#include <algorithm>
 #include <chrono>
 #include <random>
 #include <type_traits>
 
 #include "common/config.h"
-#include "common/logging.h"
-#include "common/sync_point.h"
+#include "cpp/sync_point.h"
 #include "meta-service/txn_kv.h"
 #include "rate-limiter/rate_limiter.h"
 #include "resource-manager/resource_manager.h"
@@ -38,6 +36,8 @@
 namespace doris::cloud {
 
 class Transaction;
+
+constexpr std::string_view BUILT_IN_STORAGE_VAULT_NAME = "built_in_storage_vault";
 
 class MetaServiceImpl : public cloud::MetaService {
 public:
@@ -76,10 +76,23 @@ public:
                                 GetCurrentMaxTxnResponse* response,
                                 ::google::protobuf::Closure* done) override;
 
+    void begin_sub_txn(::google::protobuf::RpcController* controller,
+                       const BeginSubTxnRequest* request, BeginSubTxnResponse* response,
+                       ::google::protobuf::Closure* done) override;
+
+    void abort_sub_txn(::google::protobuf::RpcController* controller,
+                       const AbortSubTxnRequest* request, AbortSubTxnResponse* response,
+                       ::google::protobuf::Closure* done) override;
+
     void check_txn_conflict(::google::protobuf::RpcController* controller,
                             const CheckTxnConflictRequest* request,
                             CheckTxnConflictResponse* response,
                             ::google::protobuf::Closure* done) override;
+
+    void abort_txn_with_coordinator(::google::protobuf::RpcController* controller,
+                                    const AbortTxnWithCoordinatorRequest* request,
+                                    AbortTxnWithCoordinatorResponse* response,
+                                    ::google::protobuf::Closure* done) override;
 
     void clean_txn_label(::google::protobuf::RpcController* controller,
                          const CleanTxnLabelRequest* request, CleanTxnLabelResponse* response,
@@ -133,6 +146,9 @@ public:
     void drop_index(::google::protobuf::RpcController* controller, const IndexRequest* request,
                     IndexResponse* response, ::google::protobuf::Closure* done) override;
 
+    void check_kv(::google::protobuf::RpcController* controller, const CheckKVRequest* request,
+                  CheckKVResponse* response, ::google::protobuf::Closure* done) override;
+
     void prepare_partition(::google::protobuf::RpcController* controller,
                            const PartitionRequest* request, PartitionResponse* response,
                            ::google::protobuf::Closure* done) override;
@@ -169,6 +185,11 @@ public:
                               const AlterObjStoreInfoRequest* request,
                               AlterObjStoreInfoResponse* response,
                               ::google::protobuf::Closure* done) override;
+
+    void alter_storage_vault(google::protobuf::RpcController* controller,
+                             const AlterObjStoreInfoRequest* request,
+                             AlterObjStoreInfoResponse* response,
+                             ::google::protobuf::Closure* done) override;
 
     void update_ak_sk(google::protobuf::RpcController* controller, const UpdateAkSkRequest* request,
                       UpdateAkSkResponse* response, ::google::protobuf::Closure* done) override;
@@ -249,6 +270,18 @@ public:
                             GetClusterStatusResponse* response,
                             ::google::protobuf::Closure* done) override;
 
+    void get_rl_task_commit_attach(::google::protobuf::RpcController* controller,
+                                   const GetRLTaskCommitAttachRequest* request,
+                                   GetRLTaskCommitAttachResponse* response,
+                                   ::google::protobuf::Closure* done) override;
+
+    void reset_rl_progress(::google::protobuf::RpcController* controller,
+                           const ResetRLProgressRequest* request, ResetRLProgressResponse* response,
+                           ::google::protobuf::Closure* done) override;
+
+    void get_txn_id(::google::protobuf::RpcController* controller, const GetTxnIdRequest* request,
+                    GetTxnIdResponse* response, ::google::protobuf::Closure* done) override;
+
     // ATTN: If you add a new method, please also add the corresponding implementation in `MetaServiceProxy`.
 
     std::pair<MetaServiceCode, std::string> get_instance_info(const std::string& instance_id,
@@ -313,11 +346,31 @@ public:
         call_impl(&cloud::MetaService::get_current_max_txn_id, controller, request, response, done);
     }
 
+    void begin_sub_txn(::google::protobuf::RpcController* controller,
+                       const BeginSubTxnRequest* request, BeginSubTxnResponse* response,
+                       ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::begin_sub_txn, controller, request, response, done);
+    }
+
+    void abort_sub_txn(::google::protobuf::RpcController* controller,
+                       const AbortSubTxnRequest* request, AbortSubTxnResponse* response,
+                       ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::abort_sub_txn, controller, request, response, done);
+    }
+
     void check_txn_conflict(::google::protobuf::RpcController* controller,
                             const CheckTxnConflictRequest* request,
                             CheckTxnConflictResponse* response,
                             ::google::protobuf::Closure* done) override {
         call_impl(&cloud::MetaService::check_txn_conflict, controller, request, response, done);
+    }
+
+    void abort_txn_with_coordinator(::google::protobuf::RpcController* controller,
+                                    const AbortTxnWithCoordinatorRequest* request,
+                                    AbortTxnWithCoordinatorResponse* response,
+                                    ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::abort_txn_with_coordinator, controller, request, response,
+                  done);
     }
 
     void clean_txn_label(::google::protobuf::RpcController* controller,
@@ -394,6 +447,11 @@ public:
         call_impl(&cloud::MetaService::drop_index, controller, request, response, done);
     }
 
+    void check_kv(::google::protobuf::RpcController* controller, const CheckKVRequest* request,
+                  CheckKVResponse* response, ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::check_kv, controller, request, response, done);
+    }
+
     void prepare_partition(::google::protobuf::RpcController* controller,
                            const PartitionRequest* request, PartitionResponse* response,
                            ::google::protobuf::Closure* done) override {
@@ -447,6 +505,13 @@ public:
                               AlterObjStoreInfoResponse* response,
                               ::google::protobuf::Closure* done) override {
         call_impl(&cloud::MetaService::alter_obj_store_info, controller, request, response, done);
+    }
+
+    void alter_storage_vault(google::protobuf::RpcController* controller,
+                             const AlterObjStoreInfoRequest* request,
+                             AlterObjStoreInfoResponse* response,
+                             ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::alter_storage_vault, controller, request, response, done);
     }
 
     void update_ak_sk(google::protobuf::RpcController* controller, const UpdateAkSkRequest* request,
@@ -572,6 +637,25 @@ public:
         call_impl(&cloud::MetaService::get_cluster_status, controller, request, response, done);
     }
 
+    void get_rl_task_commit_attach(::google::protobuf::RpcController* controller,
+                                   const GetRLTaskCommitAttachRequest* request,
+                                   GetRLTaskCommitAttachResponse* response,
+                                   ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::get_rl_task_commit_attach, controller, request, response,
+                  done);
+    }
+
+    void reset_rl_progress(::google::protobuf::RpcController* controller,
+                           const ResetRLProgressRequest* request, ResetRLProgressResponse* response,
+                           ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::reset_rl_progress, controller, request, response, done);
+    }
+
+    void get_txn_id(::google::protobuf::RpcController* controller, const GetTxnIdRequest* request,
+                    GetTxnIdResponse* response, ::google::protobuf::Closure* done) override {
+        call_impl(&cloud::MetaService::get_txn_id, controller, request, response, done);
+    }
+
 private:
     template <typename Request, typename Response>
     using MetaServiceMethod = void (cloud::MetaService::*)(::google::protobuf::RpcController*,
@@ -584,6 +668,8 @@ private:
                    ::google::protobuf::Closure* done) {
         static_assert(std::is_base_of_v<::google::protobuf::Message, Request>);
         static_assert(std::is_base_of_v<::google::protobuf::Message, Response>);
+
+        using namespace std::chrono;
 
         brpc::ClosureGuard done_guard(done);
         if (!config::enable_txn_store_retry) {
@@ -602,34 +688,52 @@ private:
 
         TEST_SYNC_POINT("MetaServiceProxy::call_impl:1");
 
-        int32_t retry_times = config::txn_store_retry_times;
-        uint64_t duration_ms = 0;
-        std::uniform_int_distribution<uint64_t> u(20, 200);
-        std::uniform_int_distribution<uint64_t> u2(500, 1000);
-        auto rng = std::default_random_engine {
-                static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count())};
+        int32_t retry_times = 0;
+        uint64_t duration_ms = 0, retry_drift_ms = 0;
         while (true) {
             (impl_.get()->*method)(ctrl, req, resp, brpc::DoNothing());
             MetaServiceCode code = resp->status().code();
             if (code != MetaServiceCode::KV_TXN_STORE_GET_RETRYABLE &&
                 code != MetaServiceCode::KV_TXN_STORE_COMMIT_RETRYABLE &&
-                code != MetaServiceCode::KV_TXN_STORE_CREATE_RETRYABLE) {
+                code != MetaServiceCode::KV_TXN_STORE_CREATE_RETRYABLE &&
+                code != MetaServiceCode::KV_TXN_TOO_OLD &&
+                (!config::enable_retry_txn_conflict || code != MetaServiceCode::KV_TXN_CONFLICT)) {
                 return;
             }
 
             TEST_SYNC_POINT("MetaServiceProxy::call_impl:2");
-            if (--retry_times < 0) {
+            if (retry_times == 0) {
+                // the first retry, add random drift.
+                duration seed = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch());
+                std::default_random_engine rng(static_cast<uint64_t>(seed.count()));
+                retry_drift_ms = std::uniform_int_distribution<uint64_t>(
+                        0, config::txn_store_retry_base_intervals_ms)(rng);
+            }
+
+            if (retry_times >= config::txn_store_retry_times ||
+                // Retrying KV_TXN_TOO_OLD is very expensive, so we only retry once.
+                (retry_times > 1 && code == MetaServiceCode::KV_TXN_TOO_OLD)) {
+                // For KV_TXN_CONFLICT, we should return KV_TXN_CONFLICT_RETRY_EXCEEDED_MAX_TIMES,
+                // because BE will retries the KV_TXN_CONFLICT error.
                 resp->mutable_status()->set_code(
-                        code == MetaServiceCode::KV_TXN_STORE_COMMIT_RETRYABLE ? KV_TXN_COMMIT_ERR
-                        : code == MetaServiceCode::KV_TXN_STORE_GET_RETRYABLE  ? KV_TXN_GET_ERR
-                                                                               : KV_TXN_CREATE_ERR);
+                        code == MetaServiceCode::KV_TXN_STORE_COMMIT_RETRYABLE   ? KV_TXN_COMMIT_ERR
+                        : code == MetaServiceCode::KV_TXN_STORE_GET_RETRYABLE    ? KV_TXN_GET_ERR
+                        : code == MetaServiceCode::KV_TXN_STORE_CREATE_RETRYABLE ? KV_TXN_CREATE_ERR
+                        : code == MetaServiceCode::KV_TXN_CONFLICT
+                                ? KV_TXN_CONFLICT_RETRY_EXCEEDED_MAX_TIMES
+                                : MetaServiceCode::KV_TXN_TOO_OLD);
                 return;
             }
 
-            duration_ms = retry_times > 10 ? u(rng) : u2(rng);
+            // 1 2 4 8 ...
+            duration_ms =
+                    (1 << retry_times) * config::txn_store_retry_base_intervals_ms + retry_drift_ms;
             TEST_SYNC_POINT_CALLBACK("MetaServiceProxy::call_impl_duration_ms", &duration_ms);
+
+            retry_times += 1;
             LOG(WARNING) << __PRETTY_FUNCTION__ << " sleep " << duration_ms
-                         << " ms before next round, retry times left: " << retry_times
+                         << " ms before next round, retry times left: "
+                         << (config::txn_store_retry_times - retry_times)
                          << ", code: " << MetaServiceCode_Name(code)
                          << ", msg: " << resp->status().msg();
             bthread_usleep(duration_ms * 1000);

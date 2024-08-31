@@ -42,6 +42,9 @@ struct decimal12_t;
 struct uint24_t;
 struct StringRef;
 
+using IPv4 = uint32_t;
+using IPv6 = uint128_t;
+
 namespace vectorized {
 
 /// Data types for representing elementary values from a database in RAM.
@@ -296,9 +299,6 @@ struct TypeId<String> {
 /// Not a data type in database, defined just for convenience.
 using Strings = std::vector<String>;
 
-using IPv4 = uint32_t;
-using IPv6 = uint128_t;
-
 template <>
 inline constexpr bool IsNumber<IPv6> = true;
 template <>
@@ -423,6 +423,13 @@ std::string decimal_to_string(const T& value, UInt32 scale) {
 }
 
 template <typename T>
+std::string decimal_to_string(const T& orig_value, UInt32 trunc_precision, UInt32 scale) {
+    T multiplier = decimal_scale_multiplier<T>(trunc_precision);
+    T value = orig_value % multiplier;
+    return decimal_to_string(value, scale);
+}
+
+template <typename T>
 size_t decimal_to_string(const T& value, char* dst, UInt32 scale, const T& scale_multiplier) {
     if (UNLIKELY(value == std::numeric_limits<T>::min())) {
         if constexpr (std::is_same_v<T, wide::Int256>) {
@@ -534,11 +541,11 @@ struct Decimal {
 
     /// If T is integral, the given value will be rounded to integer.
     template <std::floating_point U>
-    static constexpr U type_round(U value) noexcept {
+    static constexpr T type_round(U value) noexcept {
         if constexpr (wide::IntegralConcept<T>()) {
-            return round(value);
+            return T(round(value));
         }
-        return value;
+        return T(value);
     }
 
     static Decimal double_to_decimal(double value_) {
@@ -620,6 +627,12 @@ struct Decimal {
     static constexpr int max_string_length() { return max_decimal_string_length<T>(); }
 
     std::string to_string(UInt32 scale) const { return decimal_to_string(value, scale); }
+
+    // truncate to specified precision and scale,
+    // used by runtime filter only for now.
+    std::string to_string(UInt32 precision, UInt32 scale) const {
+        return decimal_to_string(value, precision, scale);
+    }
 
     /**
      * Got the string representation of a decimal.

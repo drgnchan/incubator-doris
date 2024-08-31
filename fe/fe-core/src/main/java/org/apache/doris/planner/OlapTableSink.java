@@ -20,6 +20,8 @@ package org.apache.doris.planner;
 import org.apache.doris.alter.SchemaChangeHandler;
 import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.LiteralExpr;
+import org.apache.doris.analysis.NullLiteral;
 import org.apache.doris.analysis.SlotDescriptor;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
@@ -43,6 +45,7 @@ import org.apache.doris.catalog.RangePartitionItem;
 import org.apache.doris.catalog.Replica;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
@@ -52,6 +55,7 @@ import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.DebugPointUtil;
 import org.apache.doris.common.util.DebugPointUtil.DebugPoint;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.rpc.RpcException;
 import org.apache.doris.system.Backend;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TColumn;
@@ -111,6 +115,7 @@ public class OlapTableSink extends DataSink {
     private boolean singleReplicaLoad;
 
     private boolean isStrictMode = false;
+    private long txnId = -1;
 
     public OlapTableSink(OlapTable dstTable, TupleDescriptor tupleDescriptor, List<Long> partitionIds,
             boolean singleReplicaLoad) {
@@ -129,13 +134,21 @@ public class OlapTableSink extends DataSink {
         tSink.setBaseSchemaVersion(dstTable.getBaseSchemaVersion());
         tSink.setLoadChannelTimeoutS(loadChannelTimeoutS);
         tSink.setSendBatchParallelism(sendBatchParallelism);
+        tSink.setWriteFileCache(ConnectContext.get() != null
+                ? !ConnectContext.get().getSessionVariable().isDisableFileCache()
+                : false);
         this.isStrictMode = isStrictMode;
+        this.txnId = txnId;
         if (loadToSingleTablet && !(dstTable.getDefaultDistributionInfo() instanceof RandomDistributionInfo)) {
             throw new AnalysisException(
                     "if load_to_single_tablet set to true," + " the olap table must be with random distribution");
         }
         tSink.setLoadToSingleTablet(loadToSingleTablet);
         tSink.setTxnTimeoutS(txnExpirationS);
+        String vaultId = dstTable.getStorageVaultId();
+        if (vaultId != null && !vaultId.isEmpty()) {
+            tSink.setStorageVaultId(vaultId);
+        }
         tDataSink = new TDataSink(getDataSinkType());
         tDataSink.setOlapTableSink(tSink);
 
@@ -178,6 +191,14 @@ public class OlapTableSink extends DataSink {
         tDataSink.getOlapTableSink().getPartition().setEnableAutomaticPartition(var);
     }
 
+    public void setAutoDetectOverwite(boolean var) {
+        tDataSink.getOlapTableSink().getPartition().setEnableAutoDetectOverwrite(var);
+    }
+
+    public void setOverwriteGroupId(long var) {
+        tDataSink.getOlapTableSink().getPartition().setOverwriteGroupId(var);
+    }
+
     // must called after tupleDescriptor is computed
     public void complete(Analyzer analyzer) throws UserException {
         for (Long partitionId : partitionIds) {
@@ -203,7 +224,7 @@ public class OlapTableSink extends DataSink {
         tSink.setNeedGenRollup(dstTable.shouldLoadToNewRollup());
         tSink.setSchema(createSchema(tSink.getDbId(), dstTable, analyzer));
         tSink.setPartition(createPartition(tSink.getDbId(), dstTable, analyzer));
-        List<TOlapTableLocationParam> locationParams = createLocation(dstTable);
+        List<TOlapTableLocationParam> locationParams = createLocation(tSink.getDbId(), dstTable);
         tSink.setLocation(locationParams.get(0));
         if (singleReplicaLoad) {
             tSink.setSlaveLocation(locationParams.get(1));
@@ -221,6 +242,7 @@ public class OlapTableSink extends DataSink {
         }
         strBuilder.append(prefix + "  TUPLE ID: " + tupleDescriptor.getId() + "\n");
         strBuilder.append(prefix + "  " + DataPartition.RANDOM.getExplainString(explainLevel));
+        strBuilder.append(prefix + "  IS_PARTIAL_UPDATE: " + isPartialUpdate);
         return strBuilder.toString();
     }
 
@@ -239,7 +261,7 @@ public class OlapTableSink extends DataSink {
         return tDataSink;
     }
 
-    private TOlapTableSchemaParam createSchema(long dbId, OlapTable table, Analyzer analyzer) throws AnalysisException {
+    public TOlapTableSchemaParam createSchema(long dbId, OlapTable table, Analyzer analyzer) throws AnalysisException {
         TOlapTableSchemaParam schemaParam = new TOlapTableSchemaParam();
         schemaParam.setDbId(dbId);
         schemaParam.setTableId(table.getId());
@@ -299,7 +321,14 @@ public class OlapTableSink extends DataSink {
             for (String s : partialUpdateInputColumns) {
                 schemaParam.addToPartialUpdateInputColumns(s);
             }
+            for (Column col : table.getFullSchema()) {
+                if (col.isAutoInc()) {
+                    schemaParam.setAutoIncrementColumn(col.getName());
+                    schemaParam.setAutoIncrementColumnUniqueId(col.getUniqueId());
+                }
+            }
         }
+        schemaParam.setInvertedIndexFileStorageFormat(table.getInvertedIndexFileStorageFormat());
         return schemaParam;
     }
 
@@ -323,18 +352,84 @@ public class OlapTableSink extends DataSink {
         return distColumns;
     }
 
-    private TOlapTablePartitionParam createPartition(long dbId, OlapTable table, Analyzer analyzer)
+    private PartitionItem createDummyPartitionItem(PartitionType partType) throws UserException {
+        if (partType == PartitionType.LIST) {
+            return ListPartitionItem.DUMMY_ITEM;
+        } else if (partType == PartitionType.RANGE) {
+            return RangePartitionItem.DUMMY_ITEM;
+        } else {
+            throw new UserException("unsupported partition for OlapTable, partition=" + partType);
+        }
+    }
+
+    private TOlapTablePartitionParam createDummyPartition(long dbId, OlapTable table, Analyzer analyzer,
+            TOlapTablePartitionParam partitionParam, PartitionInfo partitionInfo, PartitionType partType)
+            throws UserException {
+        partitionParam.setEnableAutomaticPartition(true);
+        // these partitions only use in locations. not find partition.
+        partitionParam.setPartitionsIsFake(true);
+
+        // set columns
+        for (Column partCol : partitionInfo.getPartitionColumns()) {
+            partitionParam.addToPartitionColumns(partCol.getName());
+        }
+
+        int partColNum = partitionInfo.getPartitionColumns().size();
+
+        TOlapTablePartition fakePartition = new TOlapTablePartition();
+        fakePartition.setId(0);
+        // set partition keys
+        setPartitionKeys(fakePartition, createDummyPartitionItem(partType), partColNum);
+
+        for (Long indexId : table.getIndexIdToMeta().keySet()) {
+            fakePartition.addToIndexes(new TOlapTableIndexTablets(indexId, Arrays.asList(0L)));
+            fakePartition.setNumBuckets(1);
+        }
+        fakePartition.setIsMutable(true);
+
+        DistributionInfo distInfo = table.getDefaultDistributionInfo();
+        partitionParam.setDistributedColumns(getDistColumns(distInfo));
+        partitionParam.addToPartitions(fakePartition);
+
+        ArrayList<Expr> exprSource = partitionInfo.getPartitionExprs();
+        if (exprSource != null && analyzer != null) {
+            Analyzer funcAnalyzer = new Analyzer(analyzer.getEnv(), analyzer.getContext());
+            tupleDescriptor.setTable(table);
+            funcAnalyzer.registerTupleDescriptor(tupleDescriptor);
+            // we must clone the exprs. otherwise analyze will influence the origin exprs.
+            ArrayList<Expr> exprs = new ArrayList<Expr>();
+            for (Expr e : exprSource) {
+                exprs.add(e.clone());
+            }
+            for (Expr e : exprs) {
+                e.reset();
+                e.analyze(funcAnalyzer);
+            }
+            partitionParam.setPartitionFunctionExprs(Expr.treesToThrift(exprs));
+        }
+
+        return partitionParam;
+    }
+
+    public TOlapTablePartitionParam createPartition(long dbId, OlapTable table, Analyzer analyzer)
             throws UserException {
         TOlapTablePartitionParam partitionParam = new TOlapTablePartitionParam();
+        PartitionInfo partitionInfo = table.getPartitionInfo();
+        boolean enableAutomaticPartition = partitionInfo.enableAutomaticPartition();
+        PartitionType partType = table.getPartitionInfo().getType();
         partitionParam.setDbId(dbId);
         partitionParam.setTableId(table.getId());
         partitionParam.setVersion(0);
+        partitionParam.setPartitionType(partType.toThrift());
 
-        PartitionType partType = table.getPartitionInfo().getType();
+        // create shadow partition for empty auto partition table. only use in this load.
+        if (enableAutomaticPartition && partitionIds.isEmpty()) {
+            return createDummyPartition(dbId, table, analyzer, partitionParam, partitionInfo, partType);
+        }
+
         switch (partType) {
             case LIST:
             case RANGE: {
-                PartitionInfo partitionInfo = table.getPartitionInfo();
                 for (Column partCol : partitionInfo.getPartitionColumns()) {
                     partitionParam.addToPartitionColumns(partCol.getName());
                 }
@@ -379,7 +474,6 @@ public class OlapTableSink extends DataSink {
                         }
                     }
                 }
-                boolean enableAutomaticPartition = partitionInfo.enableAutomaticPartition();
                 // for auto create partition by function expr, there is no any partition firstly,
                 // But this is required in thrift struct.
                 if (enableAutomaticPartition && partitionIds.isEmpty()) {
@@ -448,20 +542,22 @@ public class OlapTableSink extends DataSink {
                 throw new UserException("unsupported partition for OlapTable, partition=" + partType);
             }
         }
-        partitionParam.setPartitionType(partType.toThrift());
         return partitionParam;
     }
 
-    public static void setPartitionKeys(TOlapTablePartition tPartition, PartitionItem partitionItem, int partColNum) {
+    public static void setPartitionKeys(TOlapTablePartition tPartition, PartitionItem partitionItem, int partColNum)
+            throws UserException {
         if (partitionItem instanceof RangePartitionItem) {
             Range<PartitionKey> range = partitionItem.getItems();
-            // set start keys
+            // set start keys. min value is a REAL value. should be legal.
             if (range.hasLowerBound() && !range.lowerEndpoint().isMinValue()) {
                 for (int i = 0; i < partColNum; i++) {
                     tPartition.addToStartKeys(range.lowerEndpoint().getKeys().get(i).treeToThrift().getNodes().get(0));
                 }
             }
-            // set end keys
+            // TODO: support real MaxLiteral in thrift.
+            // now we dont send it to BE. if BE meet it, treat it as default value.
+            // see VOlapTablePartition's ctor in tablet_info.h
             if (range.hasUpperBound() && !range.upperEndpoint().isMaxValue()) {
                 for (int i = 0; i < partColNum; i++) {
                     tPartition.addToEndKeys(range.upperEndpoint().getKeys().get(i).treeToThrift().getNodes().get(0));
@@ -473,7 +569,12 @@ public class OlapTableSink extends DataSink {
             for (PartitionKey partitionKey : partitionKeys) {
                 List<TExprNode> tExprNodes = new ArrayList<>();
                 for (int i = 0; i < partColNum; i++) {
-                    tExprNodes.add(partitionKey.getKeys().get(i).treeToThrift().getNodes().get(0));
+                    LiteralExpr literalExpr = partitionKey.getKeys().get(i);
+                    if (literalExpr.isNullLiteral()) {
+                        tExprNodes.add(NullLiteral.create(literalExpr.getType()).treeToThrift().getNodes().get(0));
+                    } else {
+                        tExprNodes.add(literalExpr.treeToThrift().getNodes().get(0));
+                    }
                 }
                 tPartition.addToInKeys(tExprNodes);
                 tPartition.setIsDefaultPartition(partitionItem.isDefaultPartition());
@@ -481,13 +582,61 @@ public class OlapTableSink extends DataSink {
         }
     }
 
-    private List<TOlapTableLocationParam> createLocation(OlapTable table) throws UserException {
+    public List<TOlapTableLocationParam> createDummyLocation(OlapTable table) throws UserException {
+        TOlapTableLocationParam locationParam = new TOlapTableLocationParam();
+        TOlapTableLocationParam slaveLocationParam = new TOlapTableLocationParam();
+
+        final long fakeTabletId = 0;
+        SystemInfoService clusterInfo = Env.getCurrentSystemInfo();
+        List<Long> aliveBe = clusterInfo.getAllBackendIds(true);
+        if (aliveBe.isEmpty()) {
+            throw new UserException(InternalErrorCode.REPLICA_FEW_ERR, "no available BE in cluster");
+        }
+        for (int i = 0; i < table.getIndexNumber(); i++) {
+            // only one fake tablet here
+            if (singleReplicaLoad) {
+                Long[] nodes = aliveBe.toArray(new Long[0]);
+                List<Long> slaveBe = aliveBe;
+
+                Random random = new SecureRandom();
+                int masterNode = random.nextInt(nodes.length);
+                locationParam.addToTablets(new TTabletLocation(fakeTabletId,
+                        Arrays.asList(nodes[masterNode])));
+
+                slaveBe.remove(masterNode);
+                slaveLocationParam.addToTablets(new TTabletLocation(fakeTabletId,
+                        slaveBe));
+            } else {
+                locationParam.addToTablets(new TTabletLocation(fakeTabletId,
+                        Arrays.asList(aliveBe.get(0)))); // just one fake location is enough
+
+                LOG.info("created dummy location tablet_id={}, be_id={}", fakeTabletId, aliveBe.get(0));
+            }
+        }
+
+        return Arrays.asList(locationParam, slaveLocationParam);
+    }
+
+    public List<TOlapTableLocationParam> createLocation(long dbId, OlapTable table) throws UserException {
+        if (table.getPartitionInfo().enableAutomaticPartition() && partitionIds.isEmpty()) {
+            return createDummyLocation(table);
+        }
+
         TOlapTableLocationParam locationParam = new TOlapTableLocationParam();
         TOlapTableLocationParam slaveLocationParam = new TOlapTableLocationParam();
         // BE id -> path hash
         Multimap<Long, Long> allBePathsMap = HashMultimap.create();
-        for (Long partitionId : partitionIds) {
-            Partition partition = table.getPartition(partitionId);
+        List<Partition> partitions = partitionIds.stream().map(partitionId -> table.getPartition(partitionId))
+                .collect(Collectors.toList());
+        List<Long> visibleVersions = null;
+        try {
+            visibleVersions = Partition.getVisibleVersions(partitions);
+        } catch (RpcException e) {
+            throw new UserException("OlapTableSink get partition visible version failed", e);
+        }
+        for (int i = 0; i < partitions.size(); i++) {
+            Partition partition = partitions.get(i);
+            long visibleVersion = visibleVersions.get(i);
             int loadRequiredReplicaNum = table.getLoadRequiredReplicaNum(partition.getId());
             for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.ALL)) {
                 // we should ensure the replica backend is alive
@@ -496,16 +645,24 @@ public class OlapTableSink extends DataSink {
                     Multimap<Long, Long> bePathsMap = tablet.getNormalReplicaBackendPathMap();
                     if (bePathsMap.keySet().size() < loadRequiredReplicaNum) {
                         String errMsg = "tablet " + tablet.getId() + " alive replica num " + bePathsMap.keySet().size()
-                                + " < quorum replica num " + loadRequiredReplicaNum
-                                + ", alive backends: [" + StringUtils.join(bePathsMap.keySet(), ",") + "]";
-                        errMsg += " or you may not have permission to access the current cluster";
-                        if (ConnectContext.get() != null) {
-                            errMsg += " clusterName=" + ConnectContext.get().getCloudCluster();
+                                + " < load required replica num " + loadRequiredReplicaNum
+                                + ", alive backends: [" + StringUtils.join(bePathsMap.keySet(), ",") + "]"
+                                + ", detail: " + tablet.getDetailsStatusForQuery(visibleVersion);
+                        if (Config.isCloudMode()) {
+                            errMsg += ConnectContext.cloudNoBackendsReason();
+                        } else {
+                            long now = System.currentTimeMillis();
+                            long lastLoadFailedTime = tablet.getLastLoadFailedTime();
+                            tablet.setLastLoadFailedTime(now);
+                            if (now - lastLoadFailedTime >= 5000L) {
+                                Env.getCurrentEnv().getTabletScheduler().tryAddRepairTablet(
+                                        tablet, dbId, table, partition, index, 0);
+                            }
                         }
                         throw new UserException(InternalErrorCode.REPLICA_FEW_ERR, errMsg);
                     }
 
-                    debugWriteRandomChooseSink(tablet, partition.getVisibleVersion(), bePathsMap);
+                    debugWriteRandomChooseSink(tablet, visibleVersion, bePathsMap);
                     if (bePathsMap.keySet().isEmpty()) {
                         throw new UserException(InternalErrorCode.REPLICA_FEW_ERR,
                                 "tablet " + tablet.getId() + " no available replica");
@@ -577,7 +734,7 @@ public class OlapTableSink extends DataSink {
         bePathsMap.putAll(result);
     }
 
-    private TPaloNodesInfo createPaloNodesInfo() {
+    public TPaloNodesInfo createPaloNodesInfo() {
         TPaloNodesInfo nodesInfo = new TPaloNodesInfo();
         SystemInfoService systemInfoService = Env.getCurrentSystemInfo();
         for (Long id : systemInfoService.getAllBackendIds(false)) {
@@ -589,5 +746,17 @@ public class OlapTableSink extends DataSink {
 
     protected TDataSinkType getDataSinkType() {
         return TDataSinkType.OLAP_TABLE_SINK;
+    }
+
+    public OlapTable getDstTable() {
+        return dstTable;
+    }
+
+    public TupleDescriptor getTupleDescriptor() {
+        return tupleDescriptor;
+    }
+
+    public long getTxnId() {
+        return txnId;
     }
 }

@@ -56,6 +56,15 @@ def get_cluster_path(cluster_name):
     return os.path.join(LOCAL_DORIS_PATH, cluster_name)
 
 
+def get_node_name(node_type, id):
+    return "{}-{}".format(node_type, id)
+
+
+def get_node_path(cluster_name, node_type, id):
+    return os.path.join(get_cluster_path(cluster_name),
+                        get_node_name(node_type, id))
+
+
 def get_compose_file(cluster_name):
     return os.path.join(get_cluster_path(cluster_name), "docker-compose.yml")
 
@@ -246,11 +255,10 @@ class Node(object):
         return ["conf", "log"]
 
     def get_name(self):
-        return "{}-{}".format(self.node_type(), self.id)
+        return get_node_name(self.node_type(), self.id)
 
     def get_path(self):
-        return os.path.join(get_cluster_path(self.cluster.name),
-                            self.get_name())
+        return get_node_path(self.cluster.name, self.node_type(), self.id)
 
     def get_image(self):
         return self.meta.image
@@ -334,9 +342,15 @@ class Node(object):
             for path in ("/etc/localtime", "/etc/timezone",
                          "/usr/share/zoneinfo") if os.path.exists(path)
         ]
+
         if self.cluster.coverage_dir:
             volumes.append("{}:{}/coverage".format(self.cluster.coverage_dir,
                                                    DOCKER_DORIS_PATH))
+
+        extra_hosts = [
+            "{}:{}".format(node.get_name(), node.get_ip())
+            for node in self.cluster.get_all_nodes()
+        ]
 
         content = {
             "cap_add": ["SYS_PTRACE"],
@@ -349,6 +363,7 @@ class Node(object):
                     "ipv4_address": self.get_ip(),
                 }
             },
+            "extra_hosts": extra_hosts,
             "ports": self.docker_ports(),
             "ulimits": {
                 "core": -1
@@ -424,13 +439,20 @@ class BE(Node):
                 "cloud_unique_id = " + self.cloud_unique_id(),
                 "meta_service_endpoint = {}".format(
                     self.cluster.get_meta_server_addr()),
-                'tmp_file_dirs = [ {"path":"./storage/tmp","max_cache_bytes":10240000," "max_upload_bytes":10240000}]',
+                'tmp_file_dirs = [ {"path":"./storage/tmp","max_cache_bytes":10240000, "max_upload_bytes":10240000}]',
+                'enable_file_cache = true',
+                'file_cache_path = [ {{"path": "{}/storage/file_cache", "total_size":53687091200, "query_limit": 10737418240}}]'
+                .format(self.docker_home_dir()),
             ]
         return cfg
 
     def init_cluster_name(self):
         with open("{}/conf/CLUSTER_NAME".format(self.get_path()), "w") as f:
             f.write(self.cluster.be_cluster)
+
+    def get_cluster_name(self):
+        with open("{}/conf/CLUSTER_NAME".format(self.get_path()), "r") as f:
+            return f.read().strip()
 
     def init_disk(self, be_disks):
         path = self.get_path()
@@ -464,6 +486,8 @@ class BE(Node):
         for dir in dirs:
             os.makedirs(dir, exist_ok=True)
 
+        os.makedirs(path + "/storage/file_cache", exist_ok=True)
+
         with open("{}/conf/{}".format(path, self.conf_file_name()), "a") as f:
             storage_root_path = ";".join(dir_descs) if dir_descs else '""'
             f.write("\nstorage_root_path = {}\n".format(storage_root_path))
@@ -475,6 +499,7 @@ class BE(Node):
         envs = super().docker_env()
         if self.cluster.is_cloud:
             envs["CLOUD_UNIQUE_ID"] = self.cloud_unique_id()
+            envs["REG_BE_TO_MS"] = 1 if self.cluster.reg_be else 0
         return envs
 
     def cloud_unique_id(self):
@@ -505,10 +530,19 @@ class CLOUD(Node):
         return [MS_PORT]
 
     def conf_file_name(self):
-        return "doris_cloud.conf"
+        for file in os.listdir(os.path.join(self.get_path(), "conf")):
+            if file == "doris_cloud.conf" or file == "selectdb_cloud.conf":
+                return file
+        return "Not found conf file for ms or recycler"
 
 
 class MS(CLOUD):
+
+    def get_add_init_config(self):
+        cfg = super().get_add_init_config()
+        if self.cluster.ms_config:
+            cfg += self.cluster.ms_config
+        return cfg
 
     def entrypoint(self):
         return [
@@ -528,6 +562,12 @@ class MS(CLOUD):
 
 
 class RECYCLE(CLOUD):
+
+    def get_add_init_config(self):
+        cfg = super().get_add_init_config()
+        if self.cluster.recycle_config:
+            cfg += self.cluster.recycle_config
+        return cfg
 
     def entrypoint(self):
         return [
@@ -573,15 +613,19 @@ class FDB(Node):
 class Cluster(object):
 
     def __init__(self, name, subnet, image, is_cloud, fe_config, be_config,
-                 be_disks, be_cluster, coverage_dir, cloud_store_config):
+                 ms_config, recycle_config, be_disks, be_cluster, reg_be,
+                 coverage_dir, cloud_store_config):
         self.name = name
         self.subnet = subnet
         self.image = image
         self.is_cloud = is_cloud
         self.fe_config = fe_config
         self.be_config = be_config
+        self.ms_config = ms_config
+        self.recycle_config = recycle_config
         self.be_disks = be_disks
         self.be_cluster = be_cluster
+        self.reg_be = reg_be
         self.coverage_dir = coverage_dir
         self.cloud_store_config = cloud_store_config
         self.groups = {
@@ -590,13 +634,20 @@ class Cluster(object):
         }
 
     @staticmethod
-    def new(name, image, is_cloud, fe_config, be_config, be_disks, be_cluster,
-            coverage_dir, cloud_store_config):
-        os.makedirs(LOCAL_DORIS_PATH, exist_ok=True)
-        with filelock.FileLock(os.path.join(LOCAL_DORIS_PATH, "lock")):
+    def new(name, image, is_cloud, fe_config, be_config, ms_config,
+            recycle_config, be_disks, be_cluster, reg_be, coverage_dir,
+            cloud_store_config):
+        if not os.path.exists(LOCAL_DORIS_PATH):
+            os.makedirs(LOCAL_DORIS_PATH, exist_ok=True)
+            os.chmod(LOCAL_DORIS_PATH, 0o777)
+        lock_file = os.path.join(LOCAL_DORIS_PATH, "lock")
+        with filelock.FileLock(lock_file):
+            if os.getuid() == utils.get_path_uid(lock_file):
+                os.chmod(lock_file, 0o666)
             subnet = gen_subnet_prefix16()
             cluster = Cluster(name, subnet, image, is_cloud, fe_config,
-                              be_config, be_disks, be_cluster, coverage_dir,
+                              be_config, ms_config, recycle_config, be_disks,
+                              be_cluster, reg_be, coverage_dir,
                               cloud_store_config)
             os.makedirs(cluster.get_path(), exist_ok=True)
             os.makedirs(get_status_path(name), exist_ok=True)
@@ -655,7 +706,14 @@ class Cluster(object):
             raise Exception("No found {} with id {}".format(node_type, id))
         return Node.new(self, node_type, id, meta)
 
-    def get_all_nodes(self, node_type):
+    def get_all_nodes(self, node_type=None):
+        if node_type is None:
+            nodes = []
+            for nt, group in self.groups.items():
+                for id, meta in group.get_all_nodes().items():
+                    nodes.append(Node.new(self, nt, id, meta))
+            return nodes
+
         group = self.groups.get(node_type, None)
         if not group:
             raise Exception("Unknown node_type: {}".format(node_type))
@@ -685,6 +743,10 @@ class Cluster(object):
 
     def get_meta_server_addr(self):
         return "{}:{}".format(self.get_node(Node.TYPE_MS, 1).get_ip(), MS_PORT)
+
+    def get_recycle_addr(self):
+        return "{}:{}".format(
+            self.get_node(Node.TYPE_RECYCLE, 1).get_ip(), MS_PORT)
 
     def remove(self, node_type, id):
         group = self.get_group(node_type)

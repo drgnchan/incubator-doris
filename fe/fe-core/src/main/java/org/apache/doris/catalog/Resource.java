@@ -59,7 +59,8 @@ public abstract class Resource implements Writable, GsonPostProcessable {
         JDBC,
         HDFS,
         HMS,
-        ES;
+        ES,
+        AZURE;
 
         public static ResourceType fromString(String resourceType) {
             for (ResourceType type : ResourceType.values()) {
@@ -111,6 +112,9 @@ public abstract class Resource implements Writable, GsonPostProcessable {
         lock.readLock().unlock();
     }
 
+    // https://programmerr47.medium.com/gson-unsafe-problem-d1ff29d4696f
+    // Resource subclass also MUST define default ctor, otherwise when reloading object from json
+    // some not serialized field (i.e. `lock`) will be `null`.
     public Resource() {
     }
 
@@ -173,6 +177,9 @@ public abstract class Resource implements Writable, GsonPostProcessable {
                 break;
             case S3:
                 resource = new S3Resource(name);
+                break;
+            case AZURE:
+                resource = new AzureResource(name);
                 break;
             case JDBC:
                 resource = new JdbcResource(name);

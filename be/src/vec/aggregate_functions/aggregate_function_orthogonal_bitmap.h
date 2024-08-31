@@ -18,11 +18,10 @@
 #pragma once
 
 #include <glog/logging.h>
-#include <stddef.h>
-#include <stdint.h>
 
-#include <algorithm>
 #include <boost/iterator/iterator_facade.hpp>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -39,17 +38,14 @@
 #include "vec/data_types/data_type_number.h"
 #include "vec/io/io_helper.h"
 
-namespace doris {
-namespace vectorized {
+namespace doris::vectorized {
 class Arena;
 class BufferReadable;
 class BufferWritable;
-class ColumnString;
 class IColumn;
-} // namespace vectorized
-} // namespace doris
-
-namespace doris::vectorized {
+template <typename T>
+class ColumnStr;
+using ColumnString = ColumnStr<UInt32>;
 
 template <typename T>
 struct AggOrthBitmapBaseData {
@@ -57,8 +53,10 @@ public:
     using ColVecData = std::conditional_t<IsNumber<T>, ColumnVector<T>, ColumnString>;
 
     void add(const IColumn** columns, size_t row_num) {
-        const auto& bitmap_col = assert_cast<const ColumnBitmap&>(*columns[0]);
-        const auto& data_col = assert_cast<const ColVecData&>(*columns[1]);
+        const auto& bitmap_col =
+                assert_cast<const ColumnBitmap&, TypeCheckOnRelease::DISABLE>(*columns[0]);
+        const auto& data_col =
+                assert_cast<const ColVecData&, TypeCheckOnRelease::DISABLE>(*columns[1]);
         const auto& bitmap_value = bitmap_col.get_element(row_num);
 
         if constexpr (IsNumber<T>) {
@@ -75,7 +73,8 @@ public:
         if (first_init) {
             DCHECK(argument_size > 1);
             for (int idx = 2; idx < argument_size; ++idx) {
-                const auto& col = assert_cast<const ColVecData&>(*columns[idx]);
+                const auto& col =
+                        assert_cast<const ColVecData&, TypeCheckOnRelease::DISABLE>(*columns[idx]);
                 if constexpr (IsNumber<T>) {
                     bitmap.add_key(col.get_element(row_num));
                 }
@@ -206,8 +205,10 @@ public:
     using ColVecData = std::conditional_t<IsNumber<T>, ColumnVector<T>, ColumnString>;
 
     void add(const IColumn** columns, size_t row_num) {
-        const auto& bitmap_col = assert_cast<const ColumnBitmap&>(*columns[0]);
-        const auto& data_col = assert_cast<const ColVecData&>(*columns[1]);
+        const auto& bitmap_col =
+                assert_cast<const ColumnBitmap&, TypeCheckOnRelease::DISABLE>(*columns[0]);
+        const auto& data_col =
+                assert_cast<const ColVecData&, TypeCheckOnRelease::DISABLE>(*columns[1]);
         const auto& bitmap_value = bitmap_col.get_element(row_num);
         std::string update_key = data_col.get_data_at(row_num).to_string();
         bitmap_expr_cal.update(update_key, bitmap_value);
@@ -216,7 +217,8 @@ public:
     void init_add_key(const IColumn** columns, size_t row_num, int argument_size) {
         if (first_init) {
             DCHECK(argument_size > 1);
-            const auto& col = assert_cast<const ColVecData&>(*columns[2]);
+            const auto& col =
+                    assert_cast<const ColVecData&, TypeCheckOnRelease::DISABLE>(*columns[2]);
             std::string expr = col.get_data_at(row_num).to_string();
             bitmap_expr_cal.bitmap_calculation_init(expr);
             first_init = false;
@@ -310,7 +312,8 @@ struct OrthBitmapUnionCountData {
     void init_add_key(const IColumn** columns, size_t row_num, int argument_size) {}
 
     void add(const IColumn** columns, size_t row_num) {
-        const auto& column = assert_cast<const ColumnBitmap&>(*columns[0]);
+        const auto& column =
+                assert_cast<const ColumnBitmap&, TypeCheckOnRelease::DISABLE>(*columns[0]);
         value |= column.get_data()[row_num];
     }
     void merge(const OrthBitmapUnionCountData& rhs) { result += rhs.result; }
@@ -344,7 +347,7 @@ public:
 
     DataTypePtr get_return_type() const override { return Impl::get_return_type(); }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
         this->data(place).init_add_key(columns, row_num, _argument_size);
         this->data(place).add(columns, row_num);

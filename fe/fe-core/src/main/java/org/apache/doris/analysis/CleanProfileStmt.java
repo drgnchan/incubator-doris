@@ -45,6 +45,11 @@ public class CleanProfileStmt extends DdlStmt {
 
     @Override
     public RedirectStatus getRedirectStatus() {
-        return RedirectStatus.FORWARD_WITH_SYNC;
+        return RedirectStatus.NO_FORWARD;
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.CLEAN;
     }
 }

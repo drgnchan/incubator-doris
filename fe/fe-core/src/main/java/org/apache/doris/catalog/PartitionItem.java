@@ -19,14 +19,17 @@ package org.apache.doris.catalog;
 
 import org.apache.doris.analysis.PartitionKeyDesc;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.io.Writable;
 
 import java.util.Comparator;
 import java.util.Map;
+import java.util.Optional;
 
-public abstract class PartitionItem implements Comparable<PartitionItem>, Writable {
+public abstract class PartitionItem implements Comparable<PartitionItem> {
     public static final Comparator<Map.Entry<Long, PartitionItem>> ITEM_MAP_ENTRY_COMPARATOR =
             Comparator.comparing(o -> ((ListPartitionItem) o.getValue()).getItems().iterator().next());
+
+    // get the unique string of the partition item.
+    public abstract String getItemsString();
 
     public abstract <T> T getItems();
 
@@ -46,4 +49,17 @@ public abstract class PartitionItem implements Comparable<PartitionItem>, Writab
      * @throws AnalysisException
      */
     public abstract PartitionKeyDesc toPartitionKeyDesc(int pos) throws AnalysisException;
+
+    /**
+     * Check if the partition meets the time requirements
+     *
+     * @param pos The position of the partition column to be checked in all partition columns
+     * @param dateFormatOptional Convert other types to date format
+     * @param nowTruncSubSec The time to compare
+     * @return
+     * @throws AnalysisException
+     */
+    public abstract boolean isGreaterThanSpecifiedTime(int pos, Optional<String> dateFormatOptional,
+            long nowTruncSubSec)
+            throws AnalysisException;
 }

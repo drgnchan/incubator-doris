@@ -57,7 +57,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-public class DescribeStmt extends ShowStmt {
+public class DescribeStmt extends ShowStmt implements NotFallbackInParser {
     private static final Logger LOG = LogManager.getLogger(DescribeStmt.class);
     private static final ShowResultSetMetaData DESC_OLAP_TABLE_ALL_META_DATA =
             ShowResultSetMetaData.builder()
@@ -129,14 +129,13 @@ public class DescribeStmt extends ShowStmt {
             for (Column column : columns) {
                 List<String> row = Arrays.asList(
                         column.getName(),
-                        column.getOriginType().toString(),
+                        column.getOriginType().hideVersionForVersionColumn(true),
                         column.isAllowNull() ? "Yes" : "No",
                         ((Boolean) column.isKey()).toString(),
                         column.getDefaultValue() == null
                                 ? FeConstants.null_string : column.getDefaultValue(),
                         "NONE"
                 );
-                row.set(1, column.getOriginType().hideVersionForVersionColumn(false));
                 totalRows.add(row);
             }
             return;

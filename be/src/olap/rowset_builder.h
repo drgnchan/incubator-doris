@@ -82,6 +82,8 @@ public:
         return _partial_update_info;
     }
 
+    Status init_mow_context(std::shared_ptr<MowContext>& mow_context);
+
 protected:
     void _build_current_tablet_schema(int64_t index_id,
                                       const OlapTableSchemaParam* table_schema_param,
@@ -104,6 +106,7 @@ protected:
     std::unique_ptr<CalcDeleteBitmapToken> _calc_delete_bitmap_token;
     // current rowset_ids, used to do diff in publish_version
     RowsetIdUnorderedSet _rowset_ids;
+    int64_t _max_version_in_flush_phase {-1};
 
     std::shared_ptr<PartialUpdateInfo> _partial_update_info;
 
@@ -132,8 +135,6 @@ private:
     Status prepare_txn();
 
     void _garbage_collection();
-
-    Status init_mow_context(std::shared_ptr<MowContext>& mow_context);
 
     // Cast `BaseTablet` to `Tablet`
     Tablet* tablet();
